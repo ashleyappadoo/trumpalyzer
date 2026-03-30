@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://trumpalyzer.vercel.app/sitemap.xml
