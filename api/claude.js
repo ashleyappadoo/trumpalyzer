@@ -19,9 +19,8 @@ async function callAnthropic(apiKey, body, attempt = 1) {
     body: JSON.stringify(body),
   });
 
-  // Retry on 429 with exponential backoff (max 3 attempts)
-  if (res.status === 429 && attempt < 3) {
-    const wait = attempt * 8000; // 8s, 16s
+  if (res.status === 429 && attempt < 4) {
+    const wait = attempt * 15000; // 15s, 30s, 45s
     console.log(`429 rate limit — retry ${attempt}/3 in ${wait}ms`);
     await sleep(wait);
     return callAnthropic(apiKey, body, attempt + 1);
@@ -40,10 +39,13 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
   }
 
-  const { system, userMsg, max_tokens = 2000 } = req.body || {};
+  const { system, userMsg, max_tokens = 2000, delayMs = 0 } = req.body || {};
   if (!userMsg) {
     return res.status(400).json({ error: "Missing userMsg" });
   }
+
+  // Optional delay before calling Anthropic (used to space Step1 and Step3)
+  if (delayMs > 0) await sleep(delayMs);
 
   try {
     const response = await callAnthropic(apiKey, {
