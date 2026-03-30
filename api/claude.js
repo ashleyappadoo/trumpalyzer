@@ -17,7 +17,7 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
   }
 
-  const { system, userMsg, max_tokens = 1600 } = req.body || {};
+  const { system, userMsg, max_tokens = 2000 } = req.body || {};
   if (!userMsg) {
     return res.status(400).json({ error: "Missing userMsg" });
   }
