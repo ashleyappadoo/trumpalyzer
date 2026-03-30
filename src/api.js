@@ -150,6 +150,7 @@ Rules per ticker:
 - risk_reward = abs(target−entry) / abs(stop−entry), 1 decimal`,
 
     `Calculate trade levels for these tickers (all prices from Yahoo Finance live):\n${rows}\n\nReturn JSON object only.`
+  15000  // ← wait 15s before calling Anthropic (lets Step 1 rate limit window clear)
   );
 
   try {
