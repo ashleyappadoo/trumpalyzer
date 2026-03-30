@@ -23,7 +23,6 @@ export function extractJSON(text, arr = false) {
 }
 
 // ── Claude — calls our Vercel serverless proxy (/api/claude) ─────────────────
-// The actual ANTHROPIC_API_KEY lives only in Vercel env vars, never client-side.
 
 async function claude(system, userMsg, delayMs = 0) {
   const res = await fetch("/api/claude", {
@@ -110,17 +109,10 @@ export async function fetchYahoo(ticker) {
 }
 
 // ── STEP 3 — ONE batch Claude call for ALL tickers at once ────────────────────
-//
-//  Instead of 1 call per ticker (causes 429), we send all tickers + their live
-//  Yahoo prices in a single prompt. Claude returns all levels in one response.
-//
-//  tickerList: [{ ticker, signal, direction, amplitude_pct, confidence, reason, currentPrice, headline }]
-//  Returns: { TICKER: { entry_price, stop_loss, target_24h, risk_reward, trade_rationale } }
 
 export async function enrichAllTickersWithPrices(tickerList) {
   if (!tickerList.length) return {};
 
-  // Build a compact payload — one line per ticker
   const rows = tickerList.map(t =>
     `${t.ticker} | price=$${t.currentPrice} | signal=${t.signal} | dir=${t.direction} | amp=${t.amplitude_pct}% | reason: ${t.reason}`
   ).join("\n");
@@ -137,8 +129,7 @@ Return ONLY a valid JSON object keyed by ticker symbol, no markdown:
     "target_24h": 122.10,
     "risk_reward": 1.1,
     "trade_rationale": "under 80 chars"
-  },
-  "CVX": { ... }
+  }
 }
 
 Rules per ticker:
@@ -149,15 +140,13 @@ Rules per ticker:
 - Target distance = amplitude_pct × entry
 - risk_reward = abs(target−entry) / abs(stop−entry), 1 decimal`,
 
-    `Calculate trade levels for these tickers (all prices from Yahoo Finance live):\n${rows}\n\nReturn JSON object only.`
-  15000  // ← wait 15s before calling Anthropic (lets Step 1 rate limit window clear)
+    `Calculate trade levels for these tickers (all prices from Yahoo Finance live):\n${rows}\n\nReturn JSON object only.`,
+    15000
   );
 
   try {
-    const parsed = extractJSON(text, false);
-    return parsed;
+    return extractJSON(text, false);
   } catch {
-    // Full local fallback if Claude call fails
     const result = {};
     tickerList.forEach(t => {
       const mult = t.direction === "up" ? 1 : -1;
@@ -178,10 +167,6 @@ Rules per ticker:
 }
 
 // ── STEP 4 — TimesFM: 5-day forecast → convergence score ─────────────────────
-//
-//  TimesFM receives raw price history (no news context).
-//  Its forecast direction is compared against Claude's signal.
-//  If both agree → CONFIRMED. If opposite → DIVERGENT.
 
 export async function fetchTimesFMWithConvergence(closes, claudeSignal) {
   const input = closes.slice(-FORECAST_HISTORY);
@@ -190,7 +175,6 @@ export async function fetchTimesFMWithConvergence(closes, claudeSignal) {
   let values    = null;
   let simulated = false;
 
-  // Try real API
   try {
     const res = await fetch(TIMESFM_FORECAST, {
       method: "POST",
@@ -200,15 +184,14 @@ export async function fetchTimesFMWithConvergence(closes, claudeSignal) {
     if (!res.ok) throw new Error(`TimesFM ${res.status}`);
     const data = await res.json();
     values =
-      data.outputs?.[0] ??
-      data.mean?.[0]    ??
-      data.forecast?.[0]??
+      data.outputs?.[0]     ??
+      data.mean?.[0]        ??
+      data.forecast?.[0]    ??
       data.predictions?.[0] ?? null;
     if (!values?.length) throw new Error("empty");
     values = values.slice(0, FORECAST_HORIZON).map(v => +v.toFixed(2));
   } catch {
     simulated = true;
-    // Trend-biased fallback
     const direction = claudeSignal === "BUY" ? "up" : claudeSignal === "SELL" ? "down" : "flat";
     const trend = direction === "up" ? 0.007 : direction === "down" ? -0.007 : 0.001;
     values = Array.from({ length: FORECAST_HORIZON }, (_, i) =>
@@ -216,7 +199,6 @@ export async function fetchTimesFMWithConvergence(closes, claudeSignal) {
     );
   }
 
-  // Convergence analysis
   const forecastEnd   = values.at(-1);
   const forecastDelta = ((forecastEnd - currentPrice) / currentPrice) * 100;
   const tfDirection   = forecastDelta > 0.5 ? "up" : forecastDelta < -0.5 ? "down" : "flat";
