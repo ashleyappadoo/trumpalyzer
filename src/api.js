@@ -11,13 +11,11 @@ export function extractJSON(text, arr = false) {
   return JSON.parse(m[0]);
 }
 
-// useWebSearch=true  → Step 1 (news scan) needs real-time web data
-// useWebSearch=false → Step 3 (price levels) is pure calculation, no search needed
 async function claude(system, userMsg, delayMs = 0, useWebSearch = false) {
   const res = await fetch("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ system, userMsg, max_tokens: 2000, delayMs, useWebSearch }),
+    body: JSON.stringify({ system, userMsg, max_tokens: 1500, delayMs, useWebSearch }),
   });
   if (!res.ok) throw new Error(`Claude proxy ${res.status}`);
   const d = await res.json();
@@ -25,51 +23,17 @@ async function claude(system, userMsg, delayMs = 0, useWebSearch = false) {
   return d.text || "";
 }
 
-// ── STEP 1 — needs web_search ─────────────────────────────────────────────────
+// ── STEP 1 — SHORT prompt to stay under 30k token/min limit ──────────────────
 export async function fetchTrumpEvents() {
   const today = new Date().toISOString().slice(0, 10);
-  const dateLabel = new Date().toLocaleDateString("en-US", {
-    weekday: "long", month: "long", day: "numeric", year: "numeric",
-  });
 
   const text = await claude(
-    `You are a senior political-risk analyst at a hedge fund. Today is ${today}.
-Search the web for Trump's ${MAX_EVENTS} most recent market-moving news events from the last 48 hours.
-
-Return ONLY a valid JSON array of exactly ${MAX_EVENTS} objects. No markdown, no extra text:
-[
-  {
-    "headline": "under 85 chars",
-    "summary": "2 concise market-relevant sentences",
-    "source": "outlet name",
-    "published_at": "2025-03-29T14:30:00Z",
-    "hours_ago": 2.5,
-    "sentiment": "bullish|bearish|neutral",
-    "overall_signal": "BUY|SELL|WATCH|IGNORE",
-    "key_themes": ["tariffs", "energy"],
-    "tickers": [
-      {
-        "ticker": "XOM",
-        "name": "Exxon Mobil",
-        "signal": "BUY",
-        "direction": "up",
-        "amplitude_pct": 2.8,
-        "confidence": 72,
-        "reason": "under 55 chars why this ticker specifically"
-      }
-    ]
-  }
-]
-
-Critical rules:
-- Each event: 2-4 tickers with INDIVIDUAL signals (not all the same direction)
-- amplitude_pct: realistic expected % move in 24h (0.5 to 8%)
-- confidence: 40-90% only
-- DO NOT include any price levels (no entry_price, stop_loss, target)
-- Sort events most recent first (hours_ago ascending)`,
-    `Find Trump's ${MAX_EVENTS} most impactful market-moving events from the last 48h (${dateLabel}). JSON array only.`,
+    `Political-risk analyst. Today: ${today}. Return ONLY valid JSON array, no markdown.`,
+    `Search web for Trump's ${MAX_EVENTS} most recent market-moving news (last 48h). Return JSON array:
+[{"headline":"<80ch","summary":"1 sentence","source":"outlet","hours_ago":2,"sentiment":"bullish|bearish|neutral","overall_signal":"BUY|SELL|WATCH","key_themes":["tariffs"],"tickers":[{"ticker":"XOM","name":"Exxon","signal":"BUY","direction":"up","amplitude_pct":2.5,"confidence":70,"reason":"<40ch"}]}]
+Rules: 2-3 tickers per event, individual signals, NO prices, sort recent first.`,
     0,
-    true  // ← web_search ON
+    true
   );
 
   const parsed = extractJSON(text, true);
@@ -87,47 +51,27 @@ export async function fetchYahoo(ticker) {
     const closes = raw.map((v, i) => v ?? raw[i - 1] ?? 0).filter(Boolean);
     const cur    = closes.at(-1);
     const prev   = closes.at(-2);
-    return {
-      closes,
-      current: cur,
-      change:  ((cur - prev) / prev) * 100,
-    };
+    return { closes, current: cur, change: ((cur - prev) / prev) * 100 };
   } catch { return null; }
 }
 
-// ── STEP 3 — NO web_search (pure calculation) ─────────────────────────────────
+// ── STEP 3 — SHORT prompt, no web_search ─────────────────────────────────────
 export async function enrichAllTickersWithPrices(tickerList) {
   if (!tickerList.length) return {};
 
   const rows = tickerList.map(t =>
-    `${t.ticker} | price=$${t.currentPrice} | signal=${t.signal} | dir=${t.direction} | amp=${t.amplitude_pct}% | reason: ${t.reason}`
+    `${t.ticker}:$${t.currentPrice}|${t.signal}|${t.direction}|${t.amplitude_pct}%`
   ).join("\n");
 
   const text = await claude(
-    `You are a quantitative trader. Calculate precise trade levels for multiple tickers.
-All prices are REAL live prices from Yahoo Finance — use them exactly as entry anchors.
+    `Quantitative trader. Calculate trade levels. Return ONLY valid JSON object, no markdown.`,
+    `Live prices from Yahoo Finance. Calculate stop/target for each ticker:
+${rows}
 
-Return ONLY a valid JSON object keyed by ticker symbol, no markdown:
-{
-  "XOM": {
-    "entry_price": 118.43,
-    "stop_loss": 115.20,
-    "target_24h": 122.10,
-    "risk_reward": 1.1,
-    "trade_rationale": "under 80 chars"
-  }
-}
-
-Rules:
-- entry_price = exactly the given live price
-- BUY: stop_loss BELOW entry, target_24h ABOVE entry
-- SELL: stop_loss ABOVE entry, target_24h BELOW entry
-- Stop distance = 0.8–1.2× amplitude_pct of entry
-- Target distance = amplitude_pct × entry
-- risk_reward = abs(target−entry) / abs(stop−entry), 1 decimal`,
-    `Calculate trade levels for these tickers:\n${rows}\n\nReturn JSON object only.`,
+Return: {"XOM":{"entry_price":118.43,"stop_loss":115.20,"target_24h":122.10,"risk_reward":1.1,"trade_rationale":"<50ch"}}
+Rules: entry=exact live price, BUY→stop below/target above, SELL→stop above/target below, stop=0.8-1.2x amplitude, rr=1 decimal.`,
     15000,
-    false  // ← web_search OFF — pure math, no internet needed
+    false
   );
 
   try {
@@ -206,25 +150,14 @@ export async function checkTimesFMHealth() {
   } catch { return false; }
 }
 
-// ── Backtest — needs web_search ───────────────────────────────────────────────
+// ── Backtest — SHORT prompt ───────────────────────────────────────────────────
 export async function fetchBacktest() {
   const text = await claude(
-    `You are a financial backtester. Search the web for Trump's 8 most impactful market events from the last 30 days.
-Return ONLY a valid JSON array (no markdown):
-[{
-  "date": "2025-03-10",
-  "event": "under 55 chars",
-  "signal": "BUY|SELL|WATCH",
-  "ticker": "XOM",
-  "predicted": "up|down",
-  "entry_price": 115.50,
-  "exit_price": 118.15,
-  "actual_24h_pct": 2.3,
-  "outcome": "win|loss"
-}]`,
-    "Find 8 Trump market events last 30 days with 24h stock outcomes. JSON array only.",
+    `Financial backtester. Return ONLY valid JSON array, no markdown.`,
+    `Search web for Trump's 8 most impactful market events last 30 days with 24h stock outcomes.
+Return: [{"date":"2025-03-10","event":"<45ch","signal":"BUY","ticker":"XOM","predicted":"up","entry_price":115.50,"exit_price":118.15,"actual_24h_pct":2.3,"outcome":"win"}]`,
     0,
-    true  // ← web_search ON
+    true
   );
   return extractJSON(text, true);
 }
