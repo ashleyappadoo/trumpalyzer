@@ -30,17 +30,17 @@ export default function App() {
   const [lastUpdate,     setLastUpdate    ] = useState(null);
   const [timesfmOk,      setTimesfmOk    ] = useState(null);
   const [tickerQueue,    setTickerQueue   ] = useState([]);
-  const enrichingRef = useRef(false); // lock: prevents duplicate batch calls
+  const [pipelineError,  setPipelineError ] = useState(null);
+  const enrichingRef = useRef(false);
 
-  // ── Health check ───────────────────────────────────────────────────────────
   useEffect(() => { checkTimesFMHealth().then(setTimesfmOk); }, []);
 
-  // ── STEP 1: Load events ────────────────────────────────────────────────────
   const loadSignals = useCallback(async () => {
     setSigLoading(true);
-    enrichingRef.current = false; // reset lock on refresh
+    enrichingRef.current = false;
     setPrices({}); setLevels({}); setConvergences({});
     setForecasts({}); setSelectedTicker(null); setTickerQueue([]);
+    setPipelineError(null);
     try {
       const data = await fetchTrumpEvents();
       setEvents(data);
@@ -48,13 +48,15 @@ export default function App() {
       setLastUpdate(new Date());
       const all = [...new Set(data.flatMap(ev => ev.tickers?.map(t=>t.ticker)||[]))];
       setTickerQueue(all);
-    } catch(e) { console.error("Events error:", e); }
+    } catch(e) {
+      console.error("Step 1 error:", e);
+      setPipelineError(`STEP 1 (Claude News) FAILED: ${e.message}`);
+    }
     finally { setSigLoading(false); }
   }, []);
 
   useEffect(() => { loadSignals(); }, []);
 
-  // ── STEP 2: Fetch Yahoo prices for all queued tickers ──────────────────────
   useEffect(() => {
     if (!tickerQueue.length) return;
     tickerQueue.forEach(async tick => {
@@ -64,9 +66,6 @@ export default function App() {
     });
   }, [tickerQueue]);
 
-  // ── STEPS 3+4: ONE batch Claude call + parallel TimesFM ───────────────────
-  // enrichingRef prevents this from firing multiple times as Yahoo prices
-  // arrive one by one (each arrival triggers the useEffect).
   useEffect(() => {
     const allTicks = events
       .flatMap(e => e.tickers?.map(t => t.ticker) || [])
@@ -76,48 +75,54 @@ export default function App() {
     const alreadyDone    = allTicks.length > 0 && allTicks.every(t => levels[t]);
 
     if (!allPricesReady || alreadyDone || enrichingRef.current) return;
-    enrichingRef.current = true; // lock acquired — only one batch call allowed
+    enrichingRef.current = true;
 
     const run = async () => {
-      // Build list for batch Step 3
-      const tickerList = allTicks.map(tick => {
-        const meta = events.flatMap(e => e.tickers||[]).find(t => t.ticker === tick);
-        const ev   = events.find(e => e.tickers?.some(t => t.ticker === tick));
-        return {
-          ticker:        tick,
-          signal:        meta?.signal        || "WATCH",
-          direction:     meta?.direction     || "flat",
-          amplitude_pct: meta?.amplitude_pct || 2,
-          confidence:    meta?.confidence    || 60,
-          reason:        meta?.reason        || "",
-          currentPrice:  prices[tick].current,
-          headline:      ev?.headline        || "",
-        };
-      });
+      try {
+        const tickerList = allTicks.map(tick => {
+          const meta = events.flatMap(e => e.tickers||[]).find(t => t.ticker === tick);
+          const ev   = events.find(e => e.tickers?.some(t => t.ticker === tick));
+          return {
+            ticker:        tick,
+            signal:        meta?.signal        || "WATCH",
+            direction:     meta?.direction     || "flat",
+            amplitude_pct: meta?.amplitude_pct || 2,
+            confidence:    meta?.confidence    || 60,
+            reason:        meta?.reason        || "",
+            currentPrice:  prices[tick].current,
+            headline:      ev?.headline        || "",
+          };
+        });
 
-      // STEP 3 — single batch Claude call → all levels at once
-      const allLevels = await enrichAllTickersWithPrices(tickerList);
-      setLevels(allLevels);
+        const allLevels = await enrichAllTickersWithPrices(tickerList);
+        setLevels(allLevels);
+        setPipelineError(null);
+      } catch(e) {
+        console.error("Step 3 error:", e);
+        setPipelineError(`STEP 3 (Claude Levels) FAILED: ${e.message}`);
+      }
 
-      // STEP 4 — TimesFM per ticker in parallel (no rate-limit risk)
+      // Step 4 — TimesFM (runs regardless of step 3 outcome)
       allTicks.forEach(async tick => {
-        const meta = events.flatMap(e => e.tickers||[]).find(t => t.ticker === tick);
-        const fc   = await fetchTimesFMWithConvergence(prices[tick].closes, meta?.signal || "WATCH");
-        setConvergences(prev => ({ ...prev, [tick]: fc }));
-        setForecasts(prev    => ({ ...prev, [tick]: { ticker: tick, ...fc } }));
+        try {
+          const meta = events.flatMap(e => e.tickers||[]).find(t => t.ticker === tick);
+          const fc   = await fetchTimesFMWithConvergence(prices[tick].closes, meta?.signal || "WATCH");
+          setConvergences(prev => ({ ...prev, [tick]: fc }));
+          setForecasts(prev    => ({ ...prev, [tick]: { ticker: tick, ...fc } }));
+        } catch(e) {
+          console.error(`Step 4 TimesFM error for ${tick}:`, e);
+        }
       });
     };
 
     run().catch(console.error).finally(() => { enrichingRef.current = false; });
   }, [prices, events]);
 
-  // ── Select ticker for forecast view ───────────────────────────────────────
   const handleSelectTicker = useCallback(tick => {
     setSelectedTicker(tick);
     setTab("forecast");
   }, []);
 
-  // ── Backtest ───────────────────────────────────────────────────────────────
   const loadBacktest = useCallback(async () => {
     setBtLoading(true);
     try { setBacktest(await fetchBacktest()); }
@@ -129,7 +134,6 @@ export default function App() {
     if (tab==="backtest" && !backtest && !btLoading) loadBacktest();
   }, [tab]);
 
-  // ── Derived ────────────────────────────────────────────────────────────────
   const allTickers = events
     .flatMap(e => e.tickers?.map(t=>t.ticker)||[])
     .filter((v,i,a) => a.indexOf(v)===i);
@@ -167,7 +171,6 @@ export default function App() {
     };
   })() : null;
 
-  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div style={{ minHeight:"100vh", background:"var(--navy-800)",
       color:"var(--text-primary)", fontFamily:"var(--font-ui)" }}>
@@ -175,7 +178,6 @@ export default function App() {
       <div style={{ position:"fixed", inset:0, pointerEvents:"none", zIndex:1,
         backgroundImage:"repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.035) 3px,rgba(0,0,0,0.035) 4px)" }}/>
 
-      {/* LEADERBOARD AD */}
       <div style={{ padding:"8px 20px 0", position:"relative", zIndex:5 }}>
         <LeaderboardAd />
       </div>
@@ -313,6 +315,22 @@ export default function App() {
       {/* CONTENT */}
       <div style={{ padding:"20px", position:"relative", zIndex:5, maxWidth:1280, margin:"0 auto" }}>
 
+        {/* Pipeline error banner */}
+        {pipelineError && (
+          <div style={{
+            marginBottom:14, padding:"12px 16px",
+            background:"rgba(255,59,92,0.08)", border:"1px solid rgba(255,59,92,0.35)",
+            borderLeft:"3px solid var(--signal-sell)", borderRadius:2,
+            fontFamily:"var(--font-mono)", fontSize:11, color:"var(--signal-sell)",
+            lineHeight:1.5,
+          }}>
+            ⚠ {pipelineError}
+            <div style={{ marginTop:4, fontSize:9, color:"var(--text-muted)" }}>
+              Consulte les logs Vercel pour plus de détails · Clique REFRESH pour réessayer
+            </div>
+          </div>
+        )}
+
         {/* MONITOR */}
         {tab==="monitor" && (
           sigLoading ? <Spinner label="SCANNING TRUMP SIGNALS — ÉTAPE 1/4…" /> :
@@ -348,10 +366,10 @@ export default function App() {
                 background:"var(--navy-700)", border:"1px solid var(--border)",
                 borderRadius:2, display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
                 {[
-                  { step:"1 · CLAUDE NEWS",   done:events.length>0,                  note:`${events.length} événements` },
-                  { step:"2 · YAHOO PRICES",  done:Object.keys(prices).length>0,     note:`${Object.keys(prices).length}/${allTickers.length} tickers` },
-                  { step:"3 · CLAUDE LEVELS", done:Object.keys(levels).length>0,     note:`${Object.keys(levels).length} enrichis` },
-                  { step:"4 · TIMESFM",       done:Object.keys(forecasts).length>0,  note:`${confirmCount} confirmés` },
+                  { step:"1 · CLAUDE NEWS",   done:events.length>0,              note:`${events.length} événements` },
+                  { step:"2 · YAHOO PRICES",  done:Object.keys(prices).length>0, note:`${Object.keys(prices).length}/${allTickers.length} tickers` },
+                  { step:"3 · CLAUDE LEVELS", done:Object.keys(levels).length>0, note:`${Object.keys(levels).length} enrichis` },
+                  { step:"4 · TIMESFM",       done:Object.keys(forecasts).length>0, note:`${confirmCount} confirmés` },
                 ].map(({ step, done, note }) => (
                   <div key={step} style={{ textAlign:"center" }}>
                     <div style={{ fontFamily:"var(--font-mono)", fontSize:8,
@@ -364,12 +382,12 @@ export default function App() {
                 ))}
               </div>
             </div>
-          ) : (
+          ) : !pipelineError ? (
             <div style={{ textAlign:"center", padding:50,
               fontFamily:"var(--font-mono)", fontSize:11, color:"var(--text-muted)" }}>
               Appuie sur REFRESH pour scanner les signaux Trump
             </div>
-          )
+          ) : null
         )}
 
         {/* FORECAST */}
