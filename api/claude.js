@@ -28,42 +28,63 @@ export default async function handler(req, res) {
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
+    console.error("[TRUMPALYZER] FATAL: ANTHROPIC_API_KEY is not set in Vercel env vars");
     return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
   }
 
   const { system, userMsg, max_tokens = 2000, delayMs = 0, useWebSearch = false } = req.body || {};
+
   if (!userMsg) {
+    console.error("[TRUMPALYZER] Bad request: missing userMsg");
     return res.status(400).json({ error: "Missing userMsg" });
   }
 
-  if (delayMs > 0) await sleep(delayMs);
+  console.log(`[TRUMPALYZER] Request — useWebSearch:${useWebSearch} | delayMs:${delayMs} | max_tokens:${max_tokens} | userMsg length:${userMsg.length}`);
 
-  // Only include web_search tool when explicitly requested
-  const tools = useWebSearch
-    ? [{ type: "web_search_20250305", name: "web_search" }]
-    : undefined;
+  if (delayMs > 0) {
+    console.log(`[TRUMPALYZER] Waiting ${delayMs}ms before calling Anthropic...`);
+    await sleep(delayMs);
+  }
+
+  const anthropicBody = {
+    model:    "claude-sonnet-4-20250514",
+    max_tokens,
+    system:   system || "",
+    messages: [{ role: "user", content: userMsg }],
+  };
+
+  if (useWebSearch) {
+    anthropicBody.tools = [{ type: "web_search_20250305", name: "web_search" }];
+  }
+
+  console.log(`[TRUMPALYZER] Calling Anthropic — model:${anthropicBody.model} | tools:${useWebSearch ? "web_search" : "none"}`);
 
   try {
-    const body = {
-      model:    "claude-sonnet-4-20250514",
-      max_tokens,
-      system:   system || "",
-      messages: [{ role: "user", content: userMsg }],
-    };
-    if (tools) body.tools = tools;
+    const response = await callAnthropic(apiKey, anthropicBody);
 
-    const response = await callAnthropic(apiKey, body);
+    console.log(`[TRUMPALYZER] Anthropic response status: ${response.status}`);
 
     if (!response.ok) {
-      const err = await response.text();
-      return res.status(response.status).json({ error: err });
+      const errText = await response.text();
+      console.error(`[TRUMPALYZER] Anthropic error ${response.status}: ${errText}`);
+      return res.status(response.status).json({ error: errText });
     }
 
     const data = await response.json();
+    console.log(`[TRUMPALYZER] Response blocks: ${data.content?.length} | stop_reason: ${data.stop_reason}`);
+
     const text = data.content?.find(b => b.type === "text")?.text || "";
+
+    if (!text) {
+      console.warn(`[TRUMPALYZER] No text block. Content types: ${data.content?.map(b => b.type).join(", ")}`);
+    } else {
+      console.log(`[TRUMPALYZER] Text response: ${text.length} chars`);
+    }
+
     return res.status(200).json({ text });
 
   } catch (err) {
+    console.error(`[TRUMPALYZER] Fetch exception: ${err.message}`);
     return res.status(500).json({ error: err.message });
   }
 }
