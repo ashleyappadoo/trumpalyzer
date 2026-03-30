@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   fetchTrumpEvents, fetchYahoo,
   enrichAllTickersWithPrices, fetchTimesFMWithConvergence,
@@ -9,31 +9,28 @@ import { LeaderboardAd, InArticleAd } from "./components/AdSlot.jsx";
 import EventCard from "./components/EventCard.jsx";
 import ForecastChart from "./components/ForecastChart.jsx";
 
-// ─────────────────────────────────────────────────────────────────────────────
-
 const TABS = [
   { id:"monitor",  emoji:"📡", label:"MONITOR"  },
   { id:"forecast", emoji:"📈", label:"FORECAST" },
   { id:"backtest", emoji:"🔬", label:"BACKTEST" },
 ];
 
-// ─────────────────────────────────────────────────────────────────────────────
-
 export default function App() {
   const [tab,            setTab           ] = useState("monitor");
   const [events,         setEvents        ] = useState([]);
   const [activeEvent,    setActiveEvent   ] = useState(0);
   const [sigLoading,     setSigLoading    ] = useState(false);
-  const [prices,         setPrices        ] = useState({});      // { TICKER: {closes,current,change} }
-  const [levels,         setLevels        ] = useState({});      // { TICKER: {entry,stop,target,rr} }
-  const [convergences,   setConvergences  ] = useState({});      // { TICKER: convergence obj }
-  const [forecasts,      setForecasts     ] = useState({});      // { TICKER: forecast obj }
+  const [prices,         setPrices        ] = useState({});
+  const [levels,         setLevels        ] = useState({});
+  const [convergences,   setConvergences  ] = useState({});
+  const [forecasts,      setForecasts     ] = useState({});
   const [selectedTicker, setSelectedTicker] = useState(null);
   const [backtest,       setBacktest      ] = useState(null);
   const [btLoading,      setBtLoading     ] = useState(false);
   const [lastUpdate,     setLastUpdate    ] = useState(null);
   const [timesfmOk,      setTimesfmOk    ] = useState(null);
-  const [tickerQueue,    setTickerQueue   ] = useState([]);      // tickers awaiting enrichment
+  const [tickerQueue,    setTickerQueue   ] = useState([]);
+  const enrichingRef = useRef(false); // lock: prevents duplicate batch calls
 
   // ── Health check ───────────────────────────────────────────────────────────
   useEffect(() => { checkTimesFMHealth().then(setTimesfmOk); }, []);
@@ -41,6 +38,7 @@ export default function App() {
   // ── STEP 1: Load events ────────────────────────────────────────────────────
   const loadSignals = useCallback(async () => {
     setSigLoading(true);
+    enrichingRef.current = false; // reset lock on refresh
     setPrices({}); setLevels({}); setConvergences({});
     setForecasts({}); setSelectedTicker(null); setTickerQueue([]);
     try {
@@ -48,7 +46,6 @@ export default function App() {
       setEvents(data);
       setActiveEvent(0);
       setLastUpdate(new Date());
-      // Queue all unique tickers for enrichment
       const all = [...new Set(data.flatMap(ev => ev.tickers?.map(t=>t.ticker)||[]))];
       setTickerQueue(all);
     } catch(e) { console.error("Events error:", e); }
@@ -67,9 +64,9 @@ export default function App() {
     });
   }, [tickerQueue]);
 
-  // ── STEPS 3+4: Batch Claude call + parallel TimesFM ─────────────────────────
-  // Step 3: ONE single Claude call for ALL tickers (fixes 429 rate limit)
-  // Step 4: TimesFM runs per ticker in parallel (no API key, no rate limit)
+  // ── STEPS 3+4: ONE batch Claude call + parallel TimesFM ───────────────────
+  // enrichingRef prevents this from firing multiple times as Yahoo prices
+  // arrive one by one (each arrival triggers the useEffect).
   useEffect(() => {
     const allTicks = events
       .flatMap(e => e.tickers?.map(t => t.ticker) || [])
@@ -78,7 +75,8 @@ export default function App() {
     const allPricesReady = allTicks.length > 0 && allTicks.every(t => prices[t]);
     const alreadyDone    = allTicks.length > 0 && allTicks.every(t => levels[t]);
 
-    if (!allPricesReady || alreadyDone) return;
+    if (!allPricesReady || alreadyDone || enrichingRef.current) return;
+    enrichingRef.current = true; // lock acquired — only one batch call allowed
 
     const run = async () => {
       // Build list for batch Step 3
@@ -97,7 +95,7 @@ export default function App() {
         };
       });
 
-      // STEP 3 — single batch call → all levels at once
+      // STEP 3 — single batch Claude call → all levels at once
       const allLevels = await enrichAllTickersWithPrices(tickerList);
       setLevels(allLevels);
 
@@ -110,7 +108,7 @@ export default function App() {
       });
     };
 
-    run().catch(console.error);
+    run().catch(console.error).finally(() => { enrichingRef.current = false; });
   }, [prices, events]);
 
   // ── Select ticker for forecast view ───────────────────────────────────────
@@ -141,12 +139,9 @@ export default function App() {
     e.tickers?.forEach(t => { if(sigCount[t.signal]!=null) sigCount[t.signal]++; });
   });
 
-  const confirmCount = Object.values(convergences)
-    .filter(c => c.convergence==="confirmed").length;
-  const divergeCount = Object.values(convergences)
-    .filter(c => c.convergence==="divergent").length;
+  const confirmCount = Object.values(convergences).filter(c => c.convergence==="confirmed").length;
+  const divergeCount = Object.values(convergences).filter(c => c.convergence==="divergent").length;
 
-  // Chart data for selected ticker
   const chartData = (() => {
     if (!selectedTicker || !prices[selectedTicker]) return [];
     const hist = prices[selectedTicker].closes.slice(-20).map((v,i) => ({
@@ -157,18 +152,18 @@ export default function App() {
     return [...hist, ...fc.values.map((v,i) => ({ i:20+i, pred:v, label:`+${i+1}J` }))];
   })();
 
-  const lastPrice   = selectedTicker && prices[selectedTicker]?.current;
-  const tickerMeta  = allTickers.includes(selectedTicker)
+  const lastPrice  = selectedTicker && prices[selectedTicker]?.current;
+  const tickerMeta = allTickers.includes(selectedTicker)
     ? events.flatMap(e=>e.tickers||[]).find(t=>t.ticker===selectedTicker) : null;
 
   const btStats = backtest ? (() => {
     const w = backtest.filter(b=>b.outcome==="win");
     const l = backtest.filter(b=>b.outcome==="loss");
     return {
-      wr:  Math.round(w.length/backtest.length*100),
-      wc:  w.length, tot:backtest.length,
-      aw:  w.length?(w.reduce((s,b)=>s+b.actual_24h_pct,0)/w.length).toFixed(1):"—",
-      al:  l.length?(l.reduce((s,b)=>s+b.actual_24h_pct,0)/l.length).toFixed(1):"—",
+      wr: Math.round(w.length/backtest.length*100),
+      wc: w.length, tot: backtest.length,
+      aw: w.length?(w.reduce((s,b)=>s+b.actual_24h_pct,0)/w.length).toFixed(1):"—",
+      al: l.length?(l.reduce((s,b)=>s+b.actual_24h_pct,0)/l.length).toFixed(1):"—",
     };
   })() : null;
 
@@ -177,45 +172,34 @@ export default function App() {
     <div style={{ minHeight:"100vh", background:"var(--navy-800)",
       color:"var(--text-primary)", fontFamily:"var(--font-ui)" }}>
 
-      {/* Scanlines */}
       <div style={{ position:"fixed", inset:0, pointerEvents:"none", zIndex:1,
         backgroundImage:"repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.035) 3px,rgba(0,0,0,0.035) 4px)" }}/>
 
-      {/* ── LEADERBOARD AD (top) ─────────────────────────────────────────── */}
+      {/* LEADERBOARD AD */}
       <div style={{ padding:"8px 20px 0", position:"relative", zIndex:5 }}>
         <LeaderboardAd />
       </div>
 
-      {/* ── HEADER ──────────────────────────────────────────────────────── */}
-      <header style={{
-        background:"var(--navy-900)",
-        borderBottom:"2px solid var(--crimson-dark)",
-        position:"relative", zIndex:10,
-        overflow:"hidden",
-      }}>
-        {/* Red stripe */}
+      {/* HEADER */}
+      <header style={{ background:"var(--navy-900)", borderBottom:"2px solid var(--crimson-dark)",
+        position:"relative", zIndex:10, overflow:"hidden" }}>
         <div style={{ position:"absolute", top:0, left:0, right:0, height:3,
-          background:`linear-gradient(90deg, var(--crimson) 0%, var(--crimson-dark) 50%, var(--crimson) 100%)`,
+          background:"linear-gradient(90deg, var(--crimson) 0%, var(--crimson-dark) 50%, var(--crimson) 100%)",
           animation:"glow-pulse 3s ease-in-out infinite" }}/>
 
-        <div style={{ display:"flex", alignItems:"center",
-          justifyContent:"space-between", padding:"14px 20px",
-          flexWrap:"wrap", gap:10 }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+          padding:"14px 20px", flexWrap:"wrap", gap:10 }}>
 
-          {/* Logo */}
           <div style={{ display:"flex", alignItems:"center", gap:12 }}>
-            <div style={{ position:"relative" }}>
-              <div style={{ width:10, height:10, borderRadius:"50%",
-                background: sigLoading?"var(--signal-watch)":"var(--signal-buy)",
-                boxShadow:`0 0 10px ${sigLoading?"var(--signal-watch)":"var(--signal-buy)"}`,
-                animation:"pulse 2s ease-in-out infinite" }}/>
-            </div>
+            <div style={{ width:10, height:10, borderRadius:"50%",
+              background: sigLoading?"var(--signal-watch)":"var(--signal-buy)",
+              boxShadow:`0 0 10px ${sigLoading?"var(--signal-watch)":"var(--signal-buy)"}`,
+              animation:"pulse 2s ease-in-out infinite" }}/>
             <div>
-              <div style={{ fontFamily:"var(--font-display)", fontWeight:900,
-                fontSize:20, letterSpacing:2,
+              <div style={{ fontFamily:"var(--font-display)", fontWeight:900, fontSize:20,
+                letterSpacing:2,
                 background:"linear-gradient(135deg, #fff 0%, var(--gold) 60%, var(--crimson) 100%)",
-                WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent",
-                backgroundClip:"text" }}>
+                WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent", backgroundClip:"text" }}>
                 TRUMPALYZER
               </div>
               <div style={{ fontFamily:"var(--font-mono)", fontSize:8,
@@ -225,7 +209,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Signal summary */}
           {!sigLoading && events.length > 0 && (
             <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
               {[["BUY","var(--signal-buy)","0,201,122"],
@@ -235,31 +218,24 @@ export default function App() {
                   <div key={s} style={{ padding:"3px 10px", borderRadius:2,
                     fontFamily:"var(--font-mono)", fontSize:10, fontWeight:700,
                     background:`rgba(${rgb},0.08)`, border:`1px solid rgba(${rgb},0.25)`,
-                    color:col }}>
-                    {s} ×{sigCount[s]}
-                  </div>
+                    color:col }}>{s} ×{sigCount[s]}</div>
                 )
               )}
               {confirmCount > 0 && (
                 <div style={{ padding:"3px 10px", borderRadius:2,
                   fontFamily:"var(--font-mono)", fontSize:10,
                   background:"rgba(0,201,122,0.06)", border:"1px solid rgba(0,201,122,0.2)",
-                  color:"var(--signal-buy)" }}>
-                  ✓ {confirmCount} CONFIRMÉS
-                </div>
+                  color:"var(--signal-buy)" }}>✓ {confirmCount} CONFIRMÉS</div>
               )}
               {divergeCount > 0 && (
                 <div style={{ padding:"3px 10px", borderRadius:2,
                   fontFamily:"var(--font-mono)", fontSize:10,
                   background:"rgba(255,59,92,0.06)", border:"1px solid rgba(255,59,92,0.2)",
-                  color:"var(--signal-sell)" }}>
-                  ⚠ {divergeCount} DIVERGENTS
-                </div>
+                  color:"var(--signal-sell)" }}>⚠ {divergeCount} DIVERGENTS</div>
               )}
               {timesfmOk !== null && (
-                <div style={{ display:"flex", alignItems:"center", gap:5,
-                  padding:"3px 10px", borderRadius:2,
-                  background:"var(--navy-700)", border:"1px solid var(--border)" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:5, padding:"3px 10px",
+                  borderRadius:2, background:"var(--navy-700)", border:"1px solid var(--border)" }}>
                   <div style={{ width:5, height:5, borderRadius:"50%",
                     background:timesfmOk?"var(--signal-buy)":"var(--signal-sell)",
                     boxShadow:`0 0 4px ${timesfmOk?"var(--signal-buy)":"var(--signal-sell)"}` }}/>
@@ -272,11 +248,9 @@ export default function App() {
             </div>
           )}
 
-          {/* Actions */}
           <div style={{ display:"flex", alignItems:"center", gap:10 }}>
             {lastUpdate && (
-              <span style={{ fontFamily:"var(--font-mono)", fontSize:9,
-                color:"var(--text-muted)" }}>
+              <span style={{ fontFamily:"var(--font-mono)", fontSize:9, color:"var(--text-muted)" }}>
                 {lastUpdate.toLocaleTimeString()}
               </span>
             )}
@@ -286,8 +260,7 @@ export default function App() {
               border:`1px solid ${sigLoading?"var(--text-muted)":"var(--crimson)"}`,
               color: sigLoading?"var(--text-muted)":"#fff",
               borderRadius:2, fontFamily:"var(--font-mono)",
-              fontSize:10, letterSpacing:2, fontWeight:700,
-            }}>
+              fontSize:10, letterSpacing:2, fontWeight:700 }}>
               {sigLoading?"SCANNING…":"⟳ REFRESH"}
             </button>
           </div>
@@ -297,14 +270,12 @@ export default function App() {
         {!sigLoading && events.length > 0 && (
           <div style={{ borderTop:"1px solid var(--navy-500)", overflow:"hidden",
             background:"var(--navy-900)", height:28, position:"relative" }}>
-            <div style={{
-              display:"inline-flex", gap:0,
+            <div style={{ display:"inline-flex", gap:0,
               animation:"tickertape 40s linear infinite",
-              whiteSpace:"nowrap", position:"absolute",
-            }}>
-              {[...allTickers, ...allTickers, ...allTickers].map((tick, i) => {
-                const p = prices[tick];
-                const c = events.flatMap(e=>e.tickers||[]).find(t=>t.ticker===tick);
+              whiteSpace:"nowrap", position:"absolute" }}>
+              {[...allTickers,...allTickers,...allTickers].map((tick,i) => {
+                const p  = prices[tick];
+                const c  = events.flatMap(e=>e.tickers||[]).find(t=>t.ticker===tick);
                 const sc = SIG[c?.signal]||SIG.WATCH;
                 return (
                   <span key={i} style={{ display:"inline-flex", alignItems:"center",
@@ -312,11 +283,9 @@ export default function App() {
                     borderRight:"1px solid var(--navy-500)",
                     fontFamily:"var(--font-mono)", fontSize:10 }}>
                     <span style={{ color:"var(--gold)", fontWeight:700 }}>${tick}</span>
-                    {p && (
-                      <span style={{ color:p.change>=0?"var(--signal-buy)":"var(--signal-sell)" }}>
-                        {p.change>=0?"+":""}{p.change.toFixed(2)}%
-                      </span>
-                    )}
+                    {p && <span style={{ color:p.change>=0?"var(--signal-buy)":"var(--signal-sell)" }}>
+                      {p.change>=0?"+":""}{p.change.toFixed(2)}%
+                    </span>}
                     <span style={{ color:sc.color, fontSize:8 }}>{sc.icon}{c?.signal}</span>
                   </span>
                 );
@@ -326,27 +295,22 @@ export default function App() {
         )}
       </header>
 
-      {/* ── TAB BAR ─────────────────────────────────────────────────────── */}
+      {/* TAB BAR */}
       <div style={{ display:"flex", background:"var(--navy-900)",
         borderBottom:"1px solid var(--border)", padding:"0 20px",
         position:"relative", zIndex:10 }}>
         {TABS.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)} style={{
-            padding:"10px 16px",
-            background:"transparent", border:"none",
-            borderBottom: tab===t.id
-              ? "2px solid var(--crimson)"
-              : "2px solid transparent",
-            color: tab===t.id ? "var(--text-primary)" : "var(--text-muted)",
-            fontFamily:"var(--font-ui)", fontWeight:700,
-            fontSize:12, letterSpacing:2,
-          }}>
+            padding:"10px 16px", background:"transparent", border:"none",
+            borderBottom: tab===t.id?"2px solid var(--crimson)":"2px solid transparent",
+            color: tab===t.id?"var(--text-primary)":"var(--text-muted)",
+            fontFamily:"var(--font-ui)", fontWeight:700, fontSize:12, letterSpacing:2 }}>
             {t.emoji} {t.label}
           </button>
         ))}
       </div>
 
-      {/* ── CONTENT ─────────────────────────────────────────────────────── */}
+      {/* CONTENT */}
       <div style={{ padding:"20px", position:"relative", zIndex:5, maxWidth:1280, margin:"0 auto" }}>
 
         {/* MONITOR */}
@@ -360,26 +324,20 @@ export default function App() {
                   letterSpacing:3, color:"var(--text-muted)" }}>
                   {events.length} ÉVÉNEMENTS · DU PLUS RÉCENT · CLIQUER POUR DÉVELOPPER
                 </div>
-                <div style={{ fontFamily:"var(--font-mono)", fontSize:9,
-                  color:"var(--text-muted)" }}>
+                <div style={{ fontFamily:"var(--font-mono)", fontSize:9, color:"var(--text-muted)" }}>
                   Pipeline: Claude News → Yahoo Live → Claude Levels → TimesFM
                 </div>
               </div>
 
               <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-                {events.map((ev, i) => (
+                {events.map((ev,i) => (
                   <div key={i}>
                     <EventCard
-                      ev={ev}
-                      prices={prices}
-                      levels={levels}
-                      convergences={convergences}
-                      onSelectTicker={handleSelectTicker}
-                      selectedTicker={selectedTicker}
+                      ev={ev} prices={prices} levels={levels} convergences={convergences}
+                      onSelectTicker={handleSelectTicker} selectedTicker={selectedTicker}
                       isActive={activeEvent===i}
                       onClick={() => setActiveEvent(activeEvent===i?-1:i)}
                     />
-                    {/* In-article ad after 2nd event */}
                     {i===1 && <InArticleAd />}
                   </div>
                 ))}
@@ -388,13 +346,12 @@ export default function App() {
               {/* Pipeline status */}
               <div style={{ marginTop:14, padding:"10px 14px",
                 background:"var(--navy-700)", border:"1px solid var(--border)",
-                borderRadius:2, display:"grid",
-                gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
+                borderRadius:2, display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
                 {[
-                  { step:"1 · CLAUDE NEWS",   done:events.length>0,        note:`${events.length} événements`           },
-                  { step:"2 · YAHOO PRICES",  done:Object.keys(prices).length>0, note:`${Object.keys(prices).length}/${allTickers.length} tickers` },
-                  { step:"3 · CLAUDE LEVELS", done:Object.keys(levels).length>0, note:`${Object.keys(levels).length} enrichis`  },
-                  { step:"4 · TIMESFM",       done:Object.keys(forecasts).length>0, note:`${Object.keys(convergences).filter(k=>convergences[k]?.convergence==="confirmed").length} confirmés` },
+                  { step:"1 · CLAUDE NEWS",   done:events.length>0,                  note:`${events.length} événements` },
+                  { step:"2 · YAHOO PRICES",  done:Object.keys(prices).length>0,     note:`${Object.keys(prices).length}/${allTickers.length} tickers` },
+                  { step:"3 · CLAUDE LEVELS", done:Object.keys(levels).length>0,     note:`${Object.keys(levels).length} enrichis` },
+                  { step:"4 · TIMESFM",       done:Object.keys(forecasts).length>0,  note:`${confirmCount} confirmés` },
                 ].map(({ step, done, note }) => (
                   <div key={step} style={{ textAlign:"center" }}>
                     <div style={{ fontFamily:"var(--font-mono)", fontSize:8,
@@ -430,10 +387,8 @@ export default function App() {
                       background:selectedTicker===tick?c.bg:"transparent",
                       border:`1px solid ${selectedTicker===tick?c.border:"var(--border)"}`,
                       color:selectedTicker===tick?c.color:"var(--text-muted)",
-                      borderRadius:2, fontFamily:"var(--font-mono)",
-                      fontSize:10, fontWeight:700,
-                      display:"flex", alignItems:"center", gap:5,
-                    }}>
+                      borderRadius:2, fontFamily:"var(--font-mono)", fontSize:10, fontWeight:700,
+                      display:"flex", alignItems:"center", gap:5 }}>
                       {c.icon} ${tick}
                       {cv && <span style={{ fontSize:8,
                         color:cv.convergence==="confirmed"?"var(--signal-buy)":
@@ -445,15 +400,11 @@ export default function App() {
                 })}
               </div>
             )}
-
             {selectedTicker && prices[selectedTicker] && forecasts[selectedTicker] ? (
               <ForecastChart
-                forecast={forecasts[selectedTicker]}
-                chartData={chartData}
-                lastPrice={lastPrice}
-                selectedTicker={selectedTicker}
-                tickerMeta={tickerMeta}
-                levels={levels[selectedTicker]}
+                forecast={forecasts[selectedTicker]} chartData={chartData}
+                lastPrice={lastPrice} selectedTicker={selectedTicker}
+                tickerMeta={tickerMeta} levels={levels[selectedTicker]}
               />
             ) : selectedTicker ? (
               <Spinner label={`PIPELINE EN COURS POUR ${selectedTicker}…`} />
@@ -472,15 +423,14 @@ export default function App() {
           backtest ? (
             <div>
               {btStats && (
-                <div style={{ display:"grid",
-                  gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:16 }}>
-                  <StatBox label="WIN RATE"          value={`${btStats.wr}%`}          color={btStats.wr>=55?"var(--signal-buy)":"var(--signal-sell)"} />
-                  <StatBox label="SIGNAUX GAGNANTS"  value={`${btStats.wc}/${btStats.tot}`} color="var(--text-primary)" />
-                  <StatBox label="GAIN MOY. 24H"     value={`+${btStats.aw}%`}          color="var(--signal-buy)" />
-                  <StatBox label="PERTE MOY. 24H"    value={`${btStats.al}%`}           color="var(--signal-sell)" />
+                <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)",
+                  gap:10, marginBottom:16 }}>
+                  <StatBox label="WIN RATE"         value={`${btStats.wr}%`}               color={btStats.wr>=55?"var(--signal-buy)":"var(--signal-sell)"} />
+                  <StatBox label="SIGNAUX GAGNANTS" value={`${btStats.wc}/${btStats.tot}`} color="var(--text-primary)" />
+                  <StatBox label="GAIN MOY. 24H"    value={`+${btStats.aw}%`}              color="var(--signal-buy)" />
+                  <StatBox label="PERTE MOY. 24H"   value={`${btStats.al}%`}               color="var(--signal-sell)" />
                 </div>
               )}
-
               <div style={{ border:"1px solid var(--border)", borderRadius:3, overflow:"auto" }}>
                 <table style={{ width:"100%", borderCollapse:"collapse", minWidth:700 }}>
                   <thead>
@@ -497,8 +447,7 @@ export default function App() {
                     {backtest.map((row,i)=>{
                       const up=row.actual_24h_pct>=0, win=row.outcome==="win";
                       return (
-                        <tr key={i} style={{
-                          background:i%2===0?"var(--navy-700)":"var(--navy-800)",
+                        <tr key={i} style={{ background:i%2===0?"var(--navy-700)":"var(--navy-800)",
                           borderBottom:"1px solid var(--border-subtle)" }}>
                           <td style={{ padding:"7px 10px", fontFamily:"var(--font-mono)",
                             fontSize:9, color:"var(--text-muted)", whiteSpace:"nowrap" }}>{row.date}</td>
@@ -534,8 +483,7 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
-              <p style={{ marginTop:8, fontFamily:"var(--font-mono)", fontSize:9,
-                color:"var(--text-muted)" }}>
+              <p style={{ marginTop:8, fontFamily:"var(--font-mono)", fontSize:9, color:"var(--text-muted)" }}>
                 * Estimations informatives uniquement. Pas de conseil financier.
               </p>
             </div>
@@ -543,12 +491,11 @@ export default function App() {
         )}
       </div>
 
-      {/* ── FOOTER ──────────────────────────────────────────────────────── */}
+      {/* FOOTER */}
       <footer style={{ padding:"16px 20px", background:"var(--navy-900)",
         borderTop:"1px solid var(--border)", marginTop:40 }}>
-        <div style={{ maxWidth:1280, margin:"0 auto",
-          display:"flex", justifyContent:"space-between",
-          alignItems:"center", flexWrap:"wrap", gap:8 }}>
+        <div style={{ maxWidth:1280, margin:"0 auto", display:"flex",
+          justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:8 }}>
           <div>
             <span style={{ fontFamily:"var(--font-display)", fontWeight:900,
               color:"var(--gold)", fontSize:14, letterSpacing:1 }}>TRUMPALYZER</span>
