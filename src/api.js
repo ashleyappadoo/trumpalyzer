@@ -25,11 +25,11 @@ export function extractJSON(text, arr = false) {
 // ── Claude — calls our Vercel serverless proxy (/api/claude) ─────────────────
 // The actual ANTHROPIC_API_KEY lives only in Vercel env vars, never client-side.
 
-async function claude(system, userMsg) {
+async function claude(system, userMsg, delayMs = 0) {
   const res = await fetch("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ system, userMsg, max_tokens: 1600 }),
+    body: JSON.stringify({ system, userMsg, max_tokens: 2000, delayMs }),
   });
   if (!res.ok) throw new Error(`Claude proxy ${res.status}`);
   const d = await res.json();
