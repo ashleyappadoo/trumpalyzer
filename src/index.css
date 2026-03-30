@@ -1,0 +1,80 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   TRUMPALYZER — Design System
+   Aesthetic: Presidential War Room × Financial Terminal
+   Palette: Navy Deep / Crimson / Gold / White
+   Fonts: Playfair Display (headlines) · IBM Plex Mono (data) · Barlow Condensed (UI)
+════════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* Core palette */
+  --navy-900: #060912;
+  --navy-800: #0a0e1a;
+  --navy-700: #0f1425;
+  --navy-600: #141a2e;
+  --navy-500: #1c2440;
+  --navy-400: #253058;
+
+  --crimson:      #c41e3a;
+  --crimson-dark: #8b1429;
+  --crimson-glow: rgba(196, 30, 58, 0.25);
+
+  --gold:         #d4a843;
+  --gold-light:   #e8c96a;
+  --gold-glow:    rgba(212, 168, 67, 0.2);
+
+  --signal-buy:   #00c97a;
+  --signal-sell:  #ff3b5c;
+  --signal-watch: #f5a623;
+
+  --text-primary:   #f0f2f8;
+  --text-secondary: #8892b0;
+  --text-muted:     #3a4466;
+  --border:         #1c2440;
+  --border-subtle:  #141a2e;
+
+  /* Typography */
+  --font-display: 'Playfair Display', Georgia, serif;
+  --font-mono:    'IBM Plex Mono', 'Courier New', monospace;
+  --font-ui:      'Barlow Condensed', 'Arial Narrow', sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+html, body, #root { min-height: 100%; }
+body {
+  background: var(--navy-800);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────────── */
+::-webkit-scrollbar       { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--navy-900); }
+::-webkit-scrollbar-thumb { background: var(--navy-400); border-radius: 2px; }
+
+/* ── Animations ───────────────────────────────────────────────────────── */
+@keyframes pulse    { 0%,100%{opacity:1} 50%{opacity:0.25} }
+@keyframes spin     { to{transform:rotate(360deg)} }
+@keyframes fadeUp   { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
+@keyframes shimmer  { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+@keyframes tickertape {
+  0%   { transform: translateX(100vw); }
+  100% { transform: translateX(-200%); }
+}
+@keyframes scanline {
+  0%   { top: -10%; }
+  100% { top: 110%; }
+}
+@keyframes glow-pulse {
+  0%,100% { box-shadow: 0 0 8px var(--crimson-glow); }
+  50%     { box-shadow: 0 0 20px var(--crimson-glow), 0 0 40px var(--crimson-glow); }
+}
+
+/* ── Utils ────────────────────────────────────────────────────────────── */
+button { cursor: pointer; transition: all 0.15s; font-family: var(--font-ui); }
+button:disabled { cursor: not-allowed; opacity: 0.4; }
+a { color: var(--gold); text-decoration: none; }
+
+.animate-fadeUp { animation: fadeUp 0.4s ease both; }
