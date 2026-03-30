@@ -109,58 +109,70 @@ export async function fetchYahoo(ticker) {
   } catch { return null; }
 }
 
-// ── STEP 3 — Claude calculates REAL price levels using Yahoo live prices ───────
+// ── STEP 3 — ONE batch Claude call for ALL tickers at once ────────────────────
 //
-//  We pass the ACTUAL current price so Claude can anchor stop/target precisely.
+//  Instead of 1 call per ticker (causes 429), we send all tickers + their live
+//  Yahoo prices in a single prompt. Claude returns all levels in one response.
+//
+//  tickerList: [{ ticker, signal, direction, amplitude_pct, confidence, reason, currentPrice, headline }]
+//  Returns: { TICKER: { entry_price, stop_loss, target_24h, risk_reward, trade_rationale } }
 
-export async function enrichTickerWithPrices(ticker, signal, direction, amplitudePct, confidence, reason, currentPrice, eventHeadline) {
+export async function enrichAllTickersWithPrices(tickerList) {
+  if (!tickerList.length) return {};
+
+  // Build a compact payload — one line per ticker
+  const rows = tickerList.map(t =>
+    `${t.ticker} | price=$${t.currentPrice} | signal=${t.signal} | dir=${t.direction} | amp=${t.amplitude_pct}% | reason: ${t.reason}`
+  ).join("\n");
+
   const text = await claude(
-    `You are a quantitative trader calculating precise trade levels.
-The user wants to trade ${ticker} based on a Trump political event.
-You have been given the REAL current market price — use it exactly as the anchor.
+    `You are a quantitative trader. Calculate precise trade levels for multiple tickers at once.
+All prices are REAL live prices from Yahoo Finance — use them exactly as entry anchors.
 
-Return ONLY a valid JSON object, no markdown:
+Return ONLY a valid JSON object keyed by ticker symbol, no markdown:
 {
-  "entry_price": <current price, exactly as given>,
-  "stop_loss": <realistic stop level based on direction and volatility>,
-  "target_24h": <realistic 24h price target based on amplitude>,
-  "risk_reward": <target distance / stop distance, 1 decimal>,
-  "trade_rationale": "under 80 chars combining event + price context"
+  "XOM": {
+    "entry_price": 118.43,
+    "stop_loss": 115.20,
+    "target_24h": 122.10,
+    "risk_reward": 1.1,
+    "trade_rationale": "under 80 chars"
+  },
+  "CVX": { ... }
 }
 
-Rules:
-- entry_price must equal exactly ${currentPrice}
-- For BUY: stop_loss BELOW entry, target_24h ABOVE entry
-- For SELL: stop_loss ABOVE entry, target_24h BELOW entry
-- Stop distance: typically 0.8x to 1.2x the amplitude
-- Target distance: amplitude_pct × entry_price
-- risk_reward = abs(target - entry) / abs(stop - entry)`,
+Rules per ticker:
+- entry_price = exactly the given live price
+- BUY: stop_loss BELOW entry, target_24h ABOVE entry
+- SELL: stop_loss ABOVE entry, target_24h BELOW entry
+- Stop distance = 0.8–1.2× amplitude_pct of entry
+- Target distance = amplitude_pct × entry
+- risk_reward = abs(target−entry) / abs(stop−entry), 1 decimal`,
 
-    `Ticker: ${ticker}
-Current live price (from Yahoo Finance): $${currentPrice}
-Signal: ${signal} (${direction})
-Expected amplitude: ${amplitudePct}%
-Confidence: ${confidence}%
-Context: ${eventHeadline}
-Reason for this ticker: ${reason}
-
-Calculate entry, stop-loss, and 24h target. JSON only.`
+    `Calculate trade levels for these tickers (all prices from Yahoo Finance live):\n${rows}\n\nReturn JSON object only.`
   );
 
   try {
-    return extractJSON(text);
+    const parsed = extractJSON(text, false);
+    return parsed;
   } catch {
-    // Fallback: compute locally if Claude fails
-    const mult  = direction === "up" ? 1 : -1;
-    const tgt   = +(currentPrice * (1 + mult * amplitudePct / 100)).toFixed(2);
-    const stop  = +(currentPrice * (1 - mult * amplitudePct / 100 * 0.6)).toFixed(2);
-    return {
-      entry_price:    +currentPrice.toFixed(2),
-      stop_loss:      stop,
-      target_24h:     tgt,
-      risk_reward:    +(Math.abs(tgt - currentPrice) / Math.abs(stop - currentPrice)).toFixed(1),
-      trade_rationale: reason,
-    };
+    // Full local fallback if Claude call fails
+    const result = {};
+    tickerList.forEach(t => {
+      const mult = t.direction === "up" ? 1 : -1;
+      const cur  = t.currentPrice;
+      const amp  = t.amplitude_pct;
+      const tgt  = +(cur * (1 + mult * amp / 100)).toFixed(2);
+      const stop = +(cur * (1 - mult * amp / 100 * 0.8)).toFixed(2);
+      result[t.ticker] = {
+        entry_price:     +cur.toFixed(2),
+        stop_loss:       stop,
+        target_24h:      tgt,
+        risk_reward:     +(Math.abs(tgt - cur) / Math.abs(stop - cur)).toFixed(1),
+        trade_rationale: t.reason,
+      };
+    });
+    return result;
   }
 }
 
