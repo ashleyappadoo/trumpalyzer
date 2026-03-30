@@ -4,18 +4,51 @@ import {
   MAX_EVENTS, FORECAST_HORIZON, FORECAST_HISTORY,
 } from "./config.js";
 
+// ── Robust JSON extractor — handles truncated responses ───────────────────────
 export function extractJSON(text, arr = false) {
   const clean = text.replace(/```json|```/g, "").trim();
-  const m = clean.match(arr ? /\[[\s\S]*\]/ : /\{[\s\S]*\}/);
-  if (!m) throw new Error("No JSON in Claude response");
+
+  if (arr) {
+    const m = clean.match(/\[[\s\S]*\]/);
+    if (m) {
+      // Try full parse
+      try { return JSON.parse(m[0]); } catch {}
+      // Truncated — recover all complete objects
+      try {
+        const items = [];
+        let depth = 0, start = -1, inStr = false, esc = false;
+        for (let i = 0; i < m[0].length; i++) {
+          const ch = m[0][i];
+          if (esc)         { esc = false; continue; }
+          if (ch === "\\") { esc = true;  continue; }
+          if (ch === '"')  { inStr = !inStr; continue; }
+          if (inStr)       continue;
+          if (ch === "{")  { if (depth === 0) start = i; depth++; }
+          else if (ch === "}") {
+            depth--;
+            if (depth === 0 && start !== -1) {
+              try { items.push(JSON.parse(m[0].slice(start, i + 1))); } catch {}
+              start = -1;
+            }
+          }
+        }
+        if (items.length) return items;
+      } catch {}
+    }
+    throw new Error("No JSON array found");
+  }
+
+  const m = clean.match(/\{[\s\S]*\}/);
+  if (!m) throw new Error("No JSON object found");
   return JSON.parse(m[0]);
 }
 
-async function claude(system, userMsg, delayMs = 0, useWebSearch = false) {
+// ── Claude proxy ──────────────────────────────────────────────────────────────
+async function claude(system, userMsg, delayMs = 0, useWebSearch = false, max_tokens = 2500) {
   const res = await fetch("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ system, userMsg, max_tokens: 1500, delayMs, useWebSearch }),
+    body: JSON.stringify({ system, userMsg, max_tokens, delayMs, useWebSearch }),
   });
   if (!res.ok) throw new Error(`Claude proxy ${res.status}`);
   const d = await res.json();
@@ -23,17 +56,19 @@ async function claude(system, userMsg, delayMs = 0, useWebSearch = false) {
   return d.text || "";
 }
 
-// ── STEP 1 — SHORT prompt to stay under 30k token/min limit ──────────────────
+// ── STEP 1 — News scan ───────────────────────────────────────────────────────
 export async function fetchTrumpEvents() {
   const today = new Date().toISOString().slice(0, 10);
 
   const text = await claude(
     `Political-risk analyst. Today: ${today}. Return ONLY valid JSON array, no markdown.`,
-    `Search web for Trump's ${MAX_EVENTS} most recent market-moving news (last 48h). Return JSON array:
+    `Search web for Trump's ${MAX_EVENTS} most recent market-moving news (last 48h).
+Return JSON array of ${MAX_EVENTS} objects:
 [{"headline":"<80ch","summary":"1 sentence","source":"outlet","hours_ago":2,"sentiment":"bullish|bearish|neutral","overall_signal":"BUY|SELL|WATCH","key_themes":["tariffs"],"tickers":[{"ticker":"XOM","name":"Exxon","signal":"BUY","direction":"up","amplitude_pct":2.5,"confidence":70,"reason":"<40ch"}]}]
-Rules: 2-3 tickers per event, individual signals, NO prices, sort recent first.`,
+Rules: 2-3 tickers per event with individual signals, NO prices, sort recent first.`,
     0,
-    true
+    true,
+    2500
   );
 
   const parsed = extractJSON(text, true);
@@ -55,7 +90,7 @@ export async function fetchYahoo(ticker) {
   } catch { return null; }
 }
 
-// ── STEP 3 — SHORT prompt, no web_search ─────────────────────────────────────
+// ── STEP 3 — Price levels (no web_search, pure calculation) ──────────────────
 export async function enrichAllTickersWithPrices(tickerList) {
   if (!tickerList.length) return {};
 
@@ -65,13 +100,14 @@ export async function enrichAllTickersWithPrices(tickerList) {
 
   const text = await claude(
     `Quantitative trader. Calculate trade levels. Return ONLY valid JSON object, no markdown.`,
-    `Live prices from Yahoo Finance. Calculate stop/target for each ticker:
+    `Live Yahoo Finance prices. Calculate stop/target:
 ${rows}
 
 Return: {"XOM":{"entry_price":118.43,"stop_loss":115.20,"target_24h":122.10,"risk_reward":1.1,"trade_rationale":"<50ch"}}
-Rules: entry=exact live price, BUY→stop below/target above, SELL→stop above/target below, stop=0.8-1.2x amplitude, rr=1 decimal.`,
+Rules: entry=exact live price, BUY stop below/target above, SELL stop above/target below, stop=0.8-1.2x amplitude, rr=1 decimal.`,
     15000,
-    false
+    false,
+    2000
   );
 
   try {
@@ -89,7 +125,7 @@ Rules: entry=exact live price, BUY→stop below/target above, SELL→stop above/
         stop_loss:       stop,
         target_24h:      tgt,
         risk_reward:     +(Math.abs(tgt - cur) / Math.abs(stop - cur)).toFixed(1),
-        trade_rationale: t.reason,
+        trade_rationale: t.reason || "",
       };
     });
     return result;
@@ -150,14 +186,15 @@ export async function checkTimesFMHealth() {
   } catch { return false; }
 }
 
-// ── Backtest — SHORT prompt ───────────────────────────────────────────────────
+// ── Backtest ──────────────────────────────────────────────────────────────────
 export async function fetchBacktest() {
   const text = await claude(
     `Financial backtester. Return ONLY valid JSON array, no markdown.`,
     `Search web for Trump's 8 most impactful market events last 30 days with 24h stock outcomes.
 Return: [{"date":"2025-03-10","event":"<45ch","signal":"BUY","ticker":"XOM","predicted":"up","entry_price":115.50,"exit_price":118.15,"actual_24h_pct":2.3,"outcome":"win"}]`,
     0,
-    true
+    true,
+    2000
   );
   return extractJSON(text, true);
 }
