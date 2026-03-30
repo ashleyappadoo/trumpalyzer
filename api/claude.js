@@ -2,12 +2,35 @@
 //  Vercel Serverless Function — Claude API Proxy
 //  Route : POST /api/claude
 //
-//  The ANTHROPIC_API_KEY env var is set in Vercel dashboard (never in code).
-//  The client sends { system, userMsg } — never touches the key directly.
+//  - ANTHROPIC_API_KEY is set in Vercel dashboard only (never in code)
+//  - Auto-retry with exponential backoff on 429
 // ─────────────────────────────────────────────────────────────────────────────
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function callAnthropic(apiKey, body, attempt = 1) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "x-api-key":         apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify(body),
+  });
+
+  // Retry on 429 with exponential backoff (max 3 attempts)
+  if (res.status === 429 && attempt < 3) {
+    const wait = attempt * 8000; // 8s, 16s
+    console.log(`429 rate limit — retry ${attempt}/3 in ${wait}ms`);
+    await sleep(wait);
+    return callAnthropic(apiKey, body, attempt + 1);
+  }
+
+  return res;
+}
+
 export default async function handler(req, res) {
-  // Only POST
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
@@ -23,20 +46,12 @@ export default async function handler(req, res) {
   }
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type":      "application/json",
-        "x-api-key":         apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model:      "claude-sonnet-4-20250514",
-        max_tokens,
-        tools:      [{ type: "web_search_20250305", name: "web_search" }],
-        system:     system || "",
-        messages:   [{ role: "user", content: userMsg }],
-      }),
+    const response = await callAnthropic(apiKey, {
+      model:      "claude-sonnet-4-20250514",
+      max_tokens,
+      tools:      [{ type: "web_search_20250305", name: "web_search" }],
+      system:     system || "",
+      messages:   [{ role: "user", content: userMsg }],
     });
 
     if (!response.ok) {
