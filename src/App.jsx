@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   fetchTrumpEvents, fetchYahoo,
-  enrichTickerWithPrices, fetchTimesFMWithConvergence,
+  enrichAllTickersWithPrices, fetchTimesFMWithConvergence,
   fetchBacktest, checkTimesFMHealth,
 } from "./api.js";
 import { SIG, Spinner, SignalBadge, StatBox } from "./components/ui.jsx";
@@ -67,42 +67,50 @@ export default function App() {
     });
   }, [tickerQueue]);
 
-  // ── STEPS 3+4: When a price arrives, enrich that ticker in parallel ────────
+  // ── STEPS 3+4: Batch Claude call + parallel TimesFM ─────────────────────────
+  // Step 3: ONE single Claude call for ALL tickers (fixes 429 rate limit)
+  // Step 4: TimesFM runs per ticker in parallel (no API key, no rate limit)
   useEffect(() => {
-    const newTickers = Object.keys(prices).filter(tick =>
-      !levels[tick] && !convergences[tick]
-    );
-    if (!newTickers.length) return;
+    const allTicks = events
+      .flatMap(e => e.tickers?.map(t => t.ticker) || [])
+      .filter((v, i, a) => a.indexOf(v) === i);
 
-    newTickers.forEach(async tick => {
-      // Find ticker metadata from events
-      const tickMeta = events.flatMap(e => e.tickers||[]).find(t=>t.ticker===tick);
-      const evForTick = events.find(e => e.tickers?.some(t=>t.ticker===tick));
-      if (!tickMeta || !prices[tick]) return;
+    const allPricesReady = allTicks.length > 0 && allTicks.every(t => prices[t]);
+    const alreadyDone    = allTicks.length > 0 && allTicks.every(t => levels[t]);
 
-      const cur = prices[tick].current;
+    if (!allPricesReady || alreadyDone) return;
 
-      // Run Step 3 + Step 4 in parallel
-      const [enriched, fc] = await Promise.all([
-        // STEP 3: Claude calculates stop/target FROM real Yahoo price
-        enrichTickerWithPrices(
-          tick,
-          tickMeta.signal,
-          tickMeta.direction,
-          tickMeta.amplitude_pct,
-          tickMeta.confidence,
-          tickMeta.reason,
-          cur,
-          evForTick?.headline || ""
-        ),
-        // STEP 4: TimesFM forecast → convergence
-        fetchTimesFMWithConvergence(prices[tick].closes, tickMeta.signal),
-      ]);
+    const run = async () => {
+      // Build list for batch Step 3
+      const tickerList = allTicks.map(tick => {
+        const meta = events.flatMap(e => e.tickers||[]).find(t => t.ticker === tick);
+        const ev   = events.find(e => e.tickers?.some(t => t.ticker === tick));
+        return {
+          ticker:        tick,
+          signal:        meta?.signal        || "WATCH",
+          direction:     meta?.direction     || "flat",
+          amplitude_pct: meta?.amplitude_pct || 2,
+          confidence:    meta?.confidence    || 60,
+          reason:        meta?.reason        || "",
+          currentPrice:  prices[tick].current,
+          headline:      ev?.headline        || "",
+        };
+      });
 
-      setLevels(prev => ({ ...prev, [tick]: enriched }));
-      setConvergences(prev => ({ ...prev, [tick]: fc }));
-      setForecasts(prev => ({ ...prev, [tick]: { ticker:tick, ...fc } }));
-    });
+      // STEP 3 — single batch call → all levels at once
+      const allLevels = await enrichAllTickersWithPrices(tickerList);
+      setLevels(allLevels);
+
+      // STEP 4 — TimesFM per ticker in parallel (no rate-limit risk)
+      allTicks.forEach(async tick => {
+        const meta = events.flatMap(e => e.tickers||[]).find(t => t.ticker === tick);
+        const fc   = await fetchTimesFMWithConvergence(prices[tick].closes, meta?.signal || "WATCH");
+        setConvergences(prev => ({ ...prev, [tick]: fc }));
+        setForecasts(prev    => ({ ...prev, [tick]: { ticker: tick, ...fc } }));
+      });
+    };
+
+    run().catch(console.error);
   }, [prices, events]);
 
   // ── Select ticker for forecast view ───────────────────────────────────────
