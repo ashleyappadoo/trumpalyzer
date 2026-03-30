@@ -8,7 +8,6 @@
 //
 // ─────────────────────────────────────────────────────────────────────────────
 import {
-  CLAUDE_API, CLAUDE_MODEL,
   TIMESFM_FORECAST, TIMESFM_HEALTH,
   YAHOO_BASE,
   MAX_EVENTS, FORECAST_HORIZON, FORECAST_HISTORY,
@@ -23,21 +22,19 @@ export function extractJSON(text, arr = false) {
   return JSON.parse(m[0]);
 }
 
+// ── Claude — calls our Vercel serverless proxy (/api/claude) ─────────────────
+// The actual ANTHROPIC_API_KEY lives only in Vercel env vars, never client-side.
+
 async function claude(system, userMsg) {
-  const res = await fetch(CLAUDE_API, {
+  const res = await fetch("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: 1600,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
-      system,
-      messages: [{ role: "user", content: userMsg }],
-    }),
+    body: JSON.stringify({ system, userMsg, max_tokens: 1600 }),
   });
-  if (!res.ok) throw new Error(`Claude ${res.status}`);
+  if (!res.ok) throw new Error(`Claude proxy ${res.status}`);
   const d = await res.json();
-  return d.content?.find(b => b.type === "text")?.text || "";
+  if (d.error) throw new Error(d.error);
+  return d.text || "";
 }
 
 // ── STEP 1 — Claude fetches news + identifies tickers (no prices) ─────────────
