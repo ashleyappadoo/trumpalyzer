@@ -1,15 +1,17 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  TRUMPALYZER — API Pipeline v5
+//  TRUMPALYZER — API Pipeline v6
 //
-//  Step 1a · /api/news      → GDELT/NewsAPI headlines (server-side)
-//  Step 1b · /api/claude    → NLP analysis, 1 call, ~400 tokens
-//  Step 2  · Yahoo Finance  → live prices + history
-//  Step 3  · Pure JS math   → stop/target (no API call)
-//  Step 4  · /api/timesfm   → TimesFM proxied via Vercel (fixes CORS)
+//  Step 1a · /api/news     → GDELT/NewsAPI headlines
+//  Step 1b · /api/claude   → NLP, 1 call, ~400 tokens
+//  Step 2  · Yahoo Finance → live prices + 30d history
+//  Step 3  · Pure JS math  → stop/target (instant, no API)
+//  Step 4  · /api/timesfm  → TimesFM proxied (CORS fixed, 8s timeout)
 // ─────────────────────────────────────────────────────────────────────────────
 import {
   YAHOO_BASE,
-  MAX_EVENTS, FORECAST_HORIZON, FORECAST_HISTORY,
+  MAX_EVENTS,
+  FORECAST_HORIZON,
+  FORECAST_HISTORY,
 } from "./config.js";
 
 // ── Robust JSON extractor ─────────────────────────────────────────────────────
@@ -50,12 +52,12 @@ export function extractJSON(text, arr = false) {
   return JSON.parse(m[0]);
 }
 
-// ── Claude proxy ──────────────────────────────────────────────────────────────
+// ── Claude proxy (1 call per refresh) ────────────────────────────────────────
 async function claude(system, userMsg, max_tokens = 1500) {
   const res = await fetch("/api/claude", {
-    method: "POST",
+    method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ system, userMsg, max_tokens }),
+    body:    JSON.stringify({ system, userMsg, max_tokens }),
   });
   if (!res.ok) throw new Error(`Claude proxy ${res.status}`);
   const d = await res.json();
@@ -63,7 +65,7 @@ async function claude(system, userMsg, max_tokens = 1500) {
   return d.text || "";
 }
 
-// ── STEP 1a — News (/api/news → GDELT or NewsAPI) ────────────────────────────
+// ── STEP 1a — Raw news (/api/news) ────────────────────────────────────────────
 async function fetchRawNews() {
   const res = await fetch("/api/news");
   if (!res.ok) throw new Error(`News API ${res.status}`);
@@ -72,7 +74,7 @@ async function fetchRawNews() {
   return d.articles;
 }
 
-// ── STEP 1b — Claude NLP (1 call only) ───────────────────────────────────────
+// ── STEP 1b — Claude NLP ──────────────────────────────────────────────────────
 export async function fetchTrumpEvents() {
   const articles = await fetchRawNews();
 
@@ -85,7 +87,7 @@ export async function fetchTrumpEvents() {
     `Political-risk analyst. Return ONLY valid JSON array, no markdown, no explanation.`,
     `Analyze these Trump headlines. Pick ${MAX_EVENTS} most market-moving. Return JSON array:
 [{"headline":"<75ch","summary":"1 sentence","source":"outlet","hours_ago":2,"sentiment":"bullish|bearish|neutral","overall_signal":"BUY|SELL|WATCH","key_themes":["tariffs"],"tickers":[{"ticker":"XOM","name":"Exxon","signal":"BUY","direction":"up","amplitude_pct":2.5,"confidence":70,"reason":"<40ch"}]}]
-2-3 tickers per event, individual signals, NO prices, sort by impact.
+2-3 tickers per event, individual signals, NO prices, sort by market impact.
 
 Headlines:
 ${headlines}`,
@@ -111,17 +113,17 @@ export async function fetchYahoo(ticker) {
   } catch { return null; }
 }
 
-// ── STEP 3 — Pure JS math (no API call) ──────────────────────────────────────
+// ── STEP 3 — Pure JS math (no API) ───────────────────────────────────────────
 export function enrichAllTickersLocally(tickerList) {
   const result = {};
   tickerList.forEach(t => {
-    const mult      = t.direction === "up" ? 1 : t.direction === "down" ? -1 : 0;
-    const amp       = t.amplitude_pct / 100;
-    const cur       = t.currentPrice;
-    const entry     = +cur.toFixed(2);
-    const target    = +(cur * (1 + mult * amp)).toFixed(2);
-    const stop      = +(cur * (1 - mult * amp * 0.8)).toFixed(2);
-    const rr        = stop !== entry
+    const mult   = t.direction === "up" ? 1 : t.direction === "down" ? -1 : 0;
+    const amp    = t.amplitude_pct / 100;
+    const cur    = t.currentPrice;
+    const entry  = +cur.toFixed(2);
+    const target = +(cur * (1 + mult * amp)).toFixed(2);
+    const stop   = +(cur * (1 - mult * amp * 0.8)).toFixed(2);
+    const rr     = stop !== entry
       ? +(Math.abs(target - entry) / Math.abs(stop - entry)).toFixed(1)
       : 1.0;
     result[t.ticker] = {
@@ -129,39 +131,49 @@ export function enrichAllTickersLocally(tickerList) {
       stop_loss:       stop,
       target_24h:      target,
       risk_reward:     rr,
-      trade_rationale: t.reason || `${t.signal} — ${t.amplitude_pct}% amplitude`,
+      trade_rationale: t.reason || `${t.signal} — ${t.amplitude_pct}% expected move`,
     };
   });
   return result;
 }
 
-// ── STEP 4 — TimesFM via /api/timesfm Vercel proxy (fixes CORS) ──────────────
+// ── STEP 4 — TimesFM via Vercel proxy (/api/timesfm) ─────────────────────────
+//  - CORS fixed (browser → Vercel → HF, not browser → HF directly)
+//  - 8s timeout in proxy prevents Vercel hard-limit issues
+//  - Always returns a value (simulated fallback if HF unreachable)
 export async function fetchTimesFMWithConvergence(closes, claudeSignal) {
-  const input = closes.slice(-FORECAST_HISTORY);
+  const input        = closes.slice(-FORECAST_HISTORY);
   const currentPrice = input.at(-1);
-  let values = null, simulated = false;
+  let values    = null;
+  let simulated = false;
 
   try {
-    const res = await fetch("/api/timesfm", {   // ← proxied, no CORS
-      method: "POST",
+    const res = await fetch("/api/timesfm", {
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ inputs: [input], freq: [0], horizon: FORECAST_HORIZON }),
+      body:    JSON.stringify({
+        inputs:  [input],
+        freq:    [0],
+        horizon: FORECAST_HORIZON,
+      }),
     });
 
     if (!res.ok) throw new Error(`TimesFM proxy ${res.status}`);
-    const data = await res.json();
 
+    const data = await res.json();
     values =
       data.outputs?.[0]     ??
       data.mean?.[0]        ??
       data.forecast?.[0]    ??
-      data.predictions?.[0] ?? null;
+      data.predictions?.[0] ??
+      null;
 
     if (!values?.length) throw new Error("Empty TimesFM response");
     values = values.slice(0, FORECAST_HORIZON).map(v => +v.toFixed(2));
+    console.log(`[TimesFM] Real forecast OK for series length ${input.length}`);
 
   } catch (err) {
-    console.warn("TimesFM fallback:", err.message);
+    console.warn(`[TimesFM] Fallback (${err.message})`);
     simulated = true;
     const dir   = claudeSignal === "BUY" ? "up" : claudeSignal === "SELL" ? "down" : "flat";
     const trend = dir === "up" ? 0.007 : dir === "down" ? -0.007 : 0.001;
@@ -177,7 +189,7 @@ export async function fetchTimesFMWithConvergence(closes, claudeSignal) {
 
   let convergence, convergenceLabel, convergenceColor;
   if (claudeDir === "flat" || tfDir === "flat") {
-    convergence = "neutral"; convergenceLabel = "SIGNAL NEUTRE"; convergenceColor = "#f5a623";
+    convergence = "neutral";   convergenceLabel = "SIGNAL NEUTRE";    convergenceColor = "#f5a623";
   } else if (claudeDir === tfDir) {
     convergence = "confirmed"; convergenceLabel = "✓ SIGNAL CONFIRMÉ"; convergenceColor = "#00c97a";
   } else {
@@ -186,13 +198,13 @@ export async function fetchTimesFMWithConvergence(closes, claudeSignal) {
 
   return {
     values, simulated,
-    forecastDelta: +forecastDelta.toFixed(2),
-    tfDirection: tfDir,
+    forecastDelta:    +forecastDelta.toFixed(2),
+    tfDirection:      tfDir,
     convergence, convergenceLabel, convergenceColor,
   };
 }
 
-// ── Health check — via proxy ──────────────────────────────────────────────────
+// ── Health check via proxy ────────────────────────────────────────────────────
 export async function checkTimesFMHealth() {
   try {
     const res = await fetch("/api/timesfm"); // GET → health
@@ -206,7 +218,7 @@ export async function checkTimesFMHealth() {
 export async function fetchBacktest() {
   const text = await claude(
     `Financial analyst. Return ONLY valid JSON array, no markdown.`,
-    `Generate 8 realistic Trump market trade examples from the last 30 days.
+    `Generate 8 realistic Trump market trade examples from the last 30 days based on known events.
 Return: [{"date":"2025-03-10","event":"<45ch","signal":"BUY","ticker":"XOM","predicted":"up","entry_price":115.50,"exit_price":118.15,"actual_24h_pct":2.3,"outcome":"win"}]`,
     2000
   );
