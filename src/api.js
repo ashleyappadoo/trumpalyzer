@@ -1,11 +1,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  TRUMPALYZER — API Pipeline v3
+//  TRUMPALYZER — API Pipeline v4
 //
-//  Step 1a · /api/news (GDELT/NewsAPI) → raw Trump headlines (server-side)
-//  Step 1b · Claude NLP only           → signal analysis (~400 tokens, no 429)
-//  Step 2  · Yahoo Finance             → live prices + history
-//  Step 3  · Claude calculation        → stop/target from real prices (~300 tokens)
-//  Step 4  · TimesFM HF Space          → 5-day forecast + convergence
+//  Step 1a · /api/news (GDELT/NewsAPI)  → raw headlines, server-side
+//  Step 1b · Claude NLP only            → 1 Claude call, ~400 tokens, no 429
+//  Step 2  · Yahoo Finance              → live prices + history
+//  Step 3  · Pure JS math               → stop/target calculated locally (NO Claude)
+//  Step 4  · TimesFM HF Space           → 5-day forecast + convergence
+//
+//  Claude is called ONCE per refresh. No more 429.
 // ─────────────────────────────────────────────────────────────────────────────
 import {
   TIMESFM_FORECAST, TIMESFM_HEALTH,
@@ -51,12 +53,12 @@ export function extractJSON(text, arr = false) {
   return JSON.parse(m[0]);
 }
 
-// ── Claude proxy (NLP + calculation only, NO web_search) ─────────────────────
-async function claude(system, userMsg, delayMs = 0, max_tokens = 1500) {
+// ── Claude proxy (1 call per refresh max) ────────────────────────────────────
+async function claude(system, userMsg, max_tokens = 1500) {
   const res = await fetch("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ system, userMsg, max_tokens, delayMs }),
+    body: JSON.stringify({ system, userMsg, max_tokens }),
   });
   if (!res.ok) throw new Error(`Claude proxy ${res.status}`);
   const d = await res.json();
@@ -64,7 +66,7 @@ async function claude(system, userMsg, delayMs = 0, max_tokens = 1500) {
   return d.text || "";
 }
 
-// ── STEP 1a — Fetch raw news from /api/news (GDELT / NewsAPI) ────────────────
+// ── STEP 1a — Fetch raw news (/api/news → GDELT or NewsAPI) ──────────────────
 async function fetchRawNews() {
   const res = await fetch("/api/news");
   if (!res.ok) throw new Error(`News API ${res.status}`);
@@ -73,31 +75,24 @@ async function fetchRawNews() {
   return d.articles;
 }
 
-// ── STEP 1b — Claude NLP: analyze headlines, extract signals ─────────────────
-//  Claude receives plain text headlines — NO web_search tool
-//  Token usage: ~400 input + ~800 output = ~1200 tokens total (vs 15000 before)
+// ── STEP 1b — Claude NLP (THE ONLY Claude call in the whole pipeline) ─────────
 export async function fetchTrumpEvents() {
-  // 1a: get raw news
   const articles = await fetchRawNews();
 
-  // Build compact headlines string for Claude
   const headlines = articles
-    .slice(0, 15)
-    .map((a, i) => `${i + 1}. [${a.hoursAgo}h ago | ${a.source}] ${a.title}`)
+    .slice(0, 12)
+    .map((a, i) => `${i + 1}. [${a.hoursAgo}h | ${a.source}] ${a.title}`)
     .join("\n");
 
-  // 1b: Claude NLP analysis (no web_search = no token explosion)
   const text = await claude(
-    `You are a political-risk analyst. Analyze news headlines and return ONLY valid JSON array, no markdown.`,
-    `Analyze these Trump news headlines and identify the ${MAX_EVENTS} most market-moving events:
+    `Political-risk analyst. Return ONLY valid JSON array, no markdown, no explanation.`,
+    `Analyze these Trump headlines. Pick ${MAX_EVENTS} most market-moving. Return JSON array:
+[{"headline":"<75ch","summary":"1 sentence","source":"outlet","hours_ago":2,"sentiment":"bullish|bearish|neutral","overall_signal":"BUY|SELL|WATCH","key_themes":["tariffs"],"tickers":[{"ticker":"XOM","name":"Exxon","signal":"BUY","direction":"up","amplitude_pct":2.5,"confidence":70,"reason":"<40ch"}]}]
+2-3 tickers per event, individual signals, NO prices, sort by impact.
 
-${headlines}
-
-Return JSON array of up to ${MAX_EVENTS} objects:
-[{"headline":"<80ch","summary":"1 market-relevant sentence","source":"outlet","hours_ago":2,"sentiment":"bullish|bearish|neutral","overall_signal":"BUY|SELL|WATCH","key_themes":["tariffs"],"tickers":[{"ticker":"XOM","name":"Exxon","signal":"BUY","direction":"up","amplitude_pct":2.5,"confidence":70,"reason":"<40ch"}]}]
-Rules: 2-3 tickers per event, individual signals per ticker, NO prices, sort by market impact.`,
-    0,
-    1800
+Headlines:
+${headlines}`,
+    1600
   );
 
   const parsed = extractJSON(text, true);
@@ -119,46 +114,49 @@ export async function fetchYahoo(ticker) {
   } catch { return null; }
 }
 
-// ── STEP 3 — Claude price levels (pure math, ~300 tokens) ────────────────────
-export async function enrichAllTickersWithPrices(tickerList) {
-  if (!tickerList.length) return {};
+// ── STEP 3 — Pure JS math (NO Claude, NO API call) ────────────────────────────
+//
+//  Formula:
+//    entry     = live Yahoo price (exact)
+//    stop_loss = entry × (1 - direction × amplitude × stopRatio)
+//    target    = entry × (1 + direction × amplitude)
+//    rr        = |target - entry| / |stop - entry|
+//
+export function calculateLevels(ticker, currentPrice, signal, direction, amplitudePct, reason) {
+  const mult      = direction === "up" ? 1 : direction === "down" ? -1 : 0;
+  const amp       = amplitudePct / 100;
+  const stopRatio = 0.8; // stop is 80% of the amplitude
 
-  const rows = tickerList.map(t =>
-    `${t.ticker}:$${t.currentPrice}|${t.signal}|${t.direction}|${t.amplitude_pct}%`
-  ).join("\n");
+  const entry  = +currentPrice.toFixed(2);
+  const target = +(currentPrice * (1 + mult * amp)).toFixed(2);
+  const stop   = +(currentPrice * (1 - mult * amp * stopRatio)).toFixed(2);
+  const rr     = stop !== entry
+    ? +(Math.abs(target - entry) / Math.abs(stop - entry)).toFixed(1)
+    : 1.0;
 
-  const text = await claude(
-    `Quantitative trader. Calculate trade levels. Return ONLY valid JSON object, no markdown.`,
-    `Live Yahoo Finance prices. Calculate stop/target:
-${rows}
+  return {
+    entry_price:     entry,
+    stop_loss:       stop,
+    target_24h:      target,
+    risk_reward:     rr,
+    trade_rationale: reason || `${signal} signal — ${amplitudePct}% amplitude expected`,
+  };
+}
 
-Return: {"XOM":{"entry_price":118.43,"stop_loss":115.20,"target_24h":122.10,"risk_reward":1.1,"trade_rationale":"<50ch"}}
-Rules: entry=exact live price, BUY stop below/target above, SELL stop above/target below, stop=0.8-1.2x amp, rr=1 decimal.`,
-    12000,
-    1500
-  );
-
-  try {
-    return extractJSON(text, false);
-  } catch {
-    // Local fallback
-    const result = {};
-    tickerList.forEach(t => {
-      const mult = t.direction === "up" ? 1 : -1;
-      const cur  = t.currentPrice;
-      const amp  = t.amplitude_pct;
-      const tgt  = +(cur * (1 + mult * amp / 100)).toFixed(2);
-      const stop = +(cur * (1 - mult * amp / 100 * 0.8)).toFixed(2);
-      result[t.ticker] = {
-        entry_price:     +cur.toFixed(2),
-        stop_loss:       stop,
-        target_24h:      tgt,
-        risk_reward:     +(Math.abs(tgt - cur) / Math.abs(stop - cur)).toFixed(1),
-        trade_rationale: t.reason || "",
-      };
-    });
-    return result;
-  }
+// Batch version for App.jsx compatibility
+export function enrichAllTickersLocally(tickerList) {
+  const result = {};
+  tickerList.forEach(t => {
+    result[t.ticker] = calculateLevels(
+      t.ticker,
+      t.currentPrice,
+      t.signal,
+      t.direction,
+      t.amplitude_pct,
+      t.reason
+    );
+  });
+  return result;
 }
 
 // ── STEP 4 — TimesFM ─────────────────────────────────────────────────────────
@@ -215,13 +213,12 @@ export async function checkTimesFMHealth() {
   } catch { return false; }
 }
 
-// ── Backtest — Claude NLP on cached news, no web_search ──────────────────────
+// ── Backtest — Claude NLP on knowledge, 1 call ────────────────────────────────
 export async function fetchBacktest() {
   const text = await claude(
-    `Financial backtester. Return ONLY valid JSON array, no markdown.`,
-    `Based on your knowledge of Trump's market impact over the last 30 days, generate 8 representative trade examples with realistic 24h outcomes.
+    `Financial analyst. Return ONLY valid JSON array, no markdown.`,
+    `Generate 8 realistic Trump market trade examples from the last 30 days based on your knowledge.
 Return: [{"date":"2025-03-10","event":"<45ch","signal":"BUY","ticker":"XOM","predicted":"up","entry_price":115.50,"exit_price":118.15,"actual_24h_pct":2.3,"outcome":"win"}]`,
-    0,
     2000
   );
   return extractJSON(text, true);
