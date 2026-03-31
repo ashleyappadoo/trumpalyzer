@@ -189,7 +189,7 @@ export async function checkTimesFMHealth() {
     const res = await fetch("/api/timesfm");
     if (!res.ok) return false;
     const d = await res.json();
-    return d?.status === "operational";
+    return d?.status === "operational" || d?.status === "healthy";
   } catch { return false; }
 }
 
