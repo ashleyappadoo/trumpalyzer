@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   fetchTrumpEvents, fetchYahoo,
-  enrichAllTickersWithPrices, fetchTimesFMWithConvergence,
+  enrichAllTickersLocally, fetchTimesFMWithConvergence,
   fetchBacktest, checkTimesFMHealth,
 } from "./api.js";
 import { SIG, Spinner, SignalBadge, StatBox } from "./components/ui.jsx";
@@ -35,6 +35,7 @@ export default function App() {
 
   useEffect(() => { checkTimesFMHealth().then(setTimesfmOk); }, []);
 
+  // ── STEP 1: Load events (1 Claude call only) ──────────────────────────────
   const loadSignals = useCallback(async () => {
     setSigLoading(true);
     enrichingRef.current = false;
@@ -51,12 +52,14 @@ export default function App() {
     } catch(e) {
       console.error("Step 1 error:", e);
       setPipelineError(`STEP 1 (Claude News) FAILED: ${e.message}`);
+    } finally {
+      setSigLoading(false);
     }
-    finally { setSigLoading(false); }
   }, []);
 
   useEffect(() => { loadSignals(); }, []);
 
+  // ── STEP 2: Yahoo prices ──────────────────────────────────────────────────
   useEffect(() => {
     if (!tickerQueue.length) return;
     tickerQueue.forEach(async tick => {
@@ -66,6 +69,7 @@ export default function App() {
     });
   }, [tickerQueue]);
 
+  // ── STEPS 3+4: Pure JS math + TimesFM (NO Claude call here) ──────────────
   useEffect(() => {
     const allTicks = events
       .flatMap(e => e.tickers?.map(t => t.ticker) || [])
@@ -79,30 +83,28 @@ export default function App() {
 
     const run = async () => {
       try {
+        // STEP 3 — Pure JS math, instant, no API call
         const tickerList = allTicks.map(tick => {
           const meta = events.flatMap(e => e.tickers||[]).find(t => t.ticker === tick);
-          const ev   = events.find(e => e.tickers?.some(t => t.ticker === tick));
           return {
             ticker:        tick,
             signal:        meta?.signal        || "WATCH",
             direction:     meta?.direction     || "flat",
             amplitude_pct: meta?.amplitude_pct || 2,
-            confidence:    meta?.confidence    || 60,
             reason:        meta?.reason        || "",
             currentPrice:  prices[tick].current,
-            headline:      ev?.headline        || "",
           };
         });
 
-        const allLevels = await enrichAllTickersWithPrices(tickerList);
+        const allLevels = enrichAllTickersLocally(tickerList);
         setLevels(allLevels);
         setPipelineError(null);
       } catch(e) {
         console.error("Step 3 error:", e);
-        setPipelineError(`STEP 3 (Claude Levels) FAILED: ${e.message}`);
+        setPipelineError(`STEP 3 (Price Levels) FAILED: ${e.message}`);
       }
 
-      // Step 4 — TimesFM (runs regardless of step 3 outcome)
+      // STEP 4 — TimesFM per ticker in parallel
       allTicks.forEach(async tick => {
         try {
           const meta = events.flatMap(e => e.tickers||[]).find(t => t.ticker === tick);
@@ -110,7 +112,7 @@ export default function App() {
           setConvergences(prev => ({ ...prev, [tick]: fc }));
           setForecasts(prev    => ({ ...prev, [tick]: { ticker: tick, ...fc } }));
         } catch(e) {
-          console.error(`Step 4 TimesFM error for ${tick}:`, e);
+          console.error(`Step 4 error for ${tick}:`, e);
         }
       });
     };
@@ -134,6 +136,7 @@ export default function App() {
     if (tab==="backtest" && !backtest && !btLoading) loadBacktest();
   }, [tab]);
 
+  // ── Derived ───────────────────────────────────────────────────────────────
   const allTickers = events
     .flatMap(e => e.tickers?.map(t=>t.ticker)||[])
     .filter((v,i,a) => a.indexOf(v)===i);
@@ -188,10 +191,8 @@ export default function App() {
         <div style={{ position:"absolute", top:0, left:0, right:0, height:3,
           background:"linear-gradient(90deg, var(--crimson) 0%, var(--crimson-dark) 50%, var(--crimson) 100%)",
           animation:"glow-pulse 3s ease-in-out infinite" }}/>
-
         <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
           padding:"14px 20px", flexWrap:"wrap", gap:10 }}>
-
           <div style={{ display:"flex", alignItems:"center", gap:12 }}>
             <div style={{ width:10, height:10, borderRadius:"50%",
               background: sigLoading?"var(--signal-watch)":"var(--signal-buy)",
@@ -299,8 +300,7 @@ export default function App() {
 
       {/* TAB BAR */}
       <div style={{ display:"flex", background:"var(--navy-900)",
-        borderBottom:"1px solid var(--border)", padding:"0 20px",
-        position:"relative", zIndex:10 }}>
+        borderBottom:"1px solid var(--border)", padding:"0 20px", position:"relative", zIndex:10 }}>
         {TABS.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)} style={{
             padding:"10px 16px", background:"transparent", border:"none",
@@ -317,33 +317,30 @@ export default function App() {
 
         {/* Pipeline error banner */}
         {pipelineError && (
-          <div style={{
-            marginBottom:14, padding:"12px 16px",
+          <div style={{ marginBottom:14, padding:"12px 16px",
             background:"rgba(255,59,92,0.08)", border:"1px solid rgba(255,59,92,0.35)",
             borderLeft:"3px solid var(--signal-sell)", borderRadius:2,
-            fontFamily:"var(--font-mono)", fontSize:11, color:"var(--signal-sell)",
-            lineHeight:1.5,
-          }}>
+            fontFamily:"var(--font-mono)", fontSize:11, color:"var(--signal-sell)", lineHeight:1.5 }}>
             ⚠ {pipelineError}
             <div style={{ marginTop:4, fontSize:9, color:"var(--text-muted)" }}>
-              Consulte les logs Vercel pour plus de détails · Clique REFRESH pour réessayer
+              Consulte les logs Vercel · Clique REFRESH pour réessayer
             </div>
           </div>
         )}
 
         {/* MONITOR */}
         {tab==="monitor" && (
-          sigLoading ? <Spinner label="SCANNING TRUMP SIGNALS — ÉTAPE 1/4…" /> :
+          sigLoading ? <Spinner label="SCANNING TRUMP SIGNALS…" /> :
           events.length>0 ? (
             <div>
               <div style={{ display:"flex", justifyContent:"space-between",
                 alignItems:"center", marginBottom:12 }}>
                 <div style={{ fontFamily:"var(--font-mono)", fontSize:9,
                   letterSpacing:3, color:"var(--text-muted)" }}>
-                  {events.length} ÉVÉNEMENTS · DU PLUS RÉCENT · CLIQUER POUR DÉVELOPPER
+                  {events.length} ÉVÉNEMENTS · CLIQUER POUR DÉVELOPPER
                 </div>
                 <div style={{ fontFamily:"var(--font-mono)", fontSize:9, color:"var(--text-muted)" }}>
-                  Pipeline: Claude News → Yahoo Live → Claude Levels → TimesFM
+                  NewsAPI/GDELT → Claude NLP → Yahoo Live → TimesFM
                 </div>
               </div>
 
@@ -366,17 +363,17 @@ export default function App() {
                 background:"var(--navy-700)", border:"1px solid var(--border)",
                 borderRadius:2, display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
                 {[
-                  { step:"1 · CLAUDE NEWS",   done:events.length>0,              note:`${events.length} événements` },
-                  { step:"2 · YAHOO PRICES",  done:Object.keys(prices).length>0, note:`${Object.keys(prices).length}/${allTickers.length} tickers` },
-                  { step:"3 · CLAUDE LEVELS", done:Object.keys(levels).length>0, note:`${Object.keys(levels).length} enrichis` },
-                  { step:"4 · TIMESFM",       done:Object.keys(forecasts).length>0, note:`${confirmCount} confirmés` },
+                  { step:"1 · NEWS + NLP",    done:events.length>0,                  note:`${events.length} événements` },
+                  { step:"2 · YAHOO PRICES",  done:Object.keys(prices).length>0,     note:`${Object.keys(prices).length}/${allTickers.length} tickers` },
+                  { step:"3 · LEVELS (JS)",   done:Object.keys(levels).length>0,     note:`${Object.keys(levels).length} calculés` },
+                  { step:"4 · TIMESFM",       done:Object.keys(forecasts).length>0,  note:`${confirmCount} confirmés` },
                 ].map(({ step, done, note }) => (
                   <div key={step} style={{ textAlign:"center" }}>
                     <div style={{ fontFamily:"var(--font-mono)", fontSize:8,
                       letterSpacing:2, color:"var(--text-muted)", marginBottom:3 }}>{step}</div>
                     <div style={{ fontFamily:"var(--font-mono)", fontSize:10, fontWeight:700,
                       color:done?"var(--signal-buy)":"var(--text-muted)" }}>
-                      {done?"✓":sigLoading?"…":"–"} {note}
+                      {done?"✓":"–"} {note}
                     </div>
                   </div>
                 ))}
@@ -425,7 +422,7 @@ export default function App() {
                 tickerMeta={tickerMeta} levels={levels[selectedTicker]}
               />
             ) : selectedTicker ? (
-              <Spinner label={`PIPELINE EN COURS POUR ${selectedTicker}…`} />
+              <Spinner label={`CHARGEMENT ${selectedTicker}…`} />
             ) : (
               <div style={{ textAlign:"center", padding:50,
                 fontFamily:"var(--font-mono)", fontSize:11, color:"var(--text-muted)" }}>
@@ -437,7 +434,7 @@ export default function App() {
 
         {/* BACKTEST */}
         {tab==="backtest" && (
-          btLoading ? <Spinner label="BACKTESTING 30 JOURS DE SIGNAUX TRUMP…" /> :
+          btLoading ? <Spinner label="BACKTESTING 30 JOURS…" /> :
           backtest ? (
             <div>
               {btStats && (
@@ -502,7 +499,7 @@ export default function App() {
                 </table>
               </div>
               <p style={{ marginTop:8, fontFamily:"var(--font-mono)", fontSize:9, color:"var(--text-muted)" }}>
-                * Estimations informatives uniquement. Pas de conseil financier.
+                * Estimations informatives. Pas de conseil financier.
               </p>
             </div>
           ) : null
@@ -519,7 +516,7 @@ export default function App() {
               color:"var(--gold)", fontSize:14, letterSpacing:1 }}>TRUMPALYZER</span>
             <span style={{ fontFamily:"var(--font-mono)", fontSize:9,
               color:"var(--text-muted)", marginLeft:10 }}>
-              Claude API · Yahoo Finance · HF TimesFM (onaaction/timesfm-api)
+              NewsAPI/GDELT · Claude NLP · Yahoo Finance · HF TimesFM
             </span>
           </div>
           <div style={{ fontFamily:"var(--font-mono)", fontSize:9,
