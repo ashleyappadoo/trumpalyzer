@@ -12,13 +12,15 @@ export default function ForecastChart({
   const fcPct = lastPrice && targetPrice
     ? ((targetPrice - lastPrice) / lastPrice * 100) : null;
 
+  const riskColor = forecast?.riskLevel === "LOW"      ? "var(--signal-buy)"
+                  : forecast?.riskLevel === "HIGH"     ? "var(--signal-sell)"
+                  : forecast?.riskLevel === "MODERATE" ? "var(--signal-watch)"
+                  : "var(--text-muted)";
+
   return (
-    <div style={{
-      border:"1px solid var(--border)",
-      borderRadius:3, padding:"20px",
-      background:"var(--navy-700)",
-      animation:"fadeUp 0.3s ease",
-    }}>
+    <div style={{ border:"1px solid var(--border)", borderRadius:3,
+      padding:"20px", background:"var(--navy-700)", animation:"fadeUp 0.3s ease" }}>
+
       {/* Header */}
       <div style={{ display:"flex", justifyContent:"space-between",
         alignItems:"flex-start", marginBottom:16 }}>
@@ -39,6 +41,7 @@ export default function ForecastChart({
             color:"var(--text-muted)", letterSpacing:2 }}>
             TIMESFM (onaaction/timesfm-api)
             {forecast?.simulated && " · FALLBACK SIMULÉ"}
+            {forecast?.modelVersion && ` · ${forecast.modelVersion}`}
             {" · "}{new Date().toLocaleTimeString()}
           </div>
         </div>
@@ -56,6 +59,30 @@ export default function ForecastChart({
           </div>
         )}
       </div>
+
+      {/* TimesFM metrics row — only when real data */}
+      {!forecast?.simulated && forecast?.trend && (
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)",
+          gap:8, marginBottom:16, padding:"10px 12px",
+          background:"var(--navy-800)", border:"1px solid var(--border)", borderRadius:2 }}>
+          {[
+            { k:"TENDANCE",   v: forecast.trend?.toUpperCase() || "—",
+              c: forecast.trend==="upward"?"var(--signal-buy)":forecast.trend==="downward"?"var(--signal-sell)":"var(--text-secondary)" },
+            { k:"RISQUE",     v: forecast.riskLevel || "—",      c: riskColor },
+            { k:"STABILITÉ",  v: forecast.stabilityScore != null ? `${forecast.stabilityScore.toFixed(1)}/100` : "—",
+              c: forecast.stabilityScore > 80 ? "var(--signal-buy)" : forecast.stabilityScore > 50 ? "var(--signal-watch)" : "var(--signal-sell)" },
+            { k:"VOLATILITÉ", v: forecast.volatility != null ? `${(forecast.volatility * 100).toFixed(2)}%` : "—",
+              c: forecast.volatility < 0.02 ? "var(--signal-buy)" : forecast.volatility < 0.05 ? "var(--signal-watch)" : "var(--signal-sell)" },
+          ].map(({ k, v, c }) => (
+            <div key={k} style={{ textAlign:"center" }}>
+              <div style={{ fontFamily:"var(--font-mono)", fontSize:8, letterSpacing:2,
+                color:"var(--text-muted)", marginBottom:3 }}>{k}</div>
+              <div style={{ fontFamily:"var(--font-mono)", fontSize:11,
+                fontWeight:700, color:c }}>{v}</div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Chart */}
       <ResponsiveContainer width="100%" height={220}>
@@ -79,13 +106,10 @@ export default function ForecastChart({
             tickLine={false} axisLine={false} width={62}
             tickFormatter={v => `$${v.toFixed(0)}`}/>
           <Tooltip content={<CustomTooltip/>}/>
-          <ReferenceLine x="TODAY"
-            stroke="var(--crimson)" strokeOpacity={0.3} strokeDasharray="4 4"/>
-          <Area type="monotone" dataKey="hist"
-            stroke="var(--gold)" strokeWidth={2}
+          <ReferenceLine x="TODAY" stroke="var(--crimson)" strokeOpacity={0.3} strokeDasharray="4 4"/>
+          <Area type="monotone" dataKey="hist" stroke="var(--gold)" strokeWidth={2}
             fill="url(#gHist)" dot={false} connectNulls/>
-          <Area type="monotone" dataKey="pred"
-            stroke="var(--signal-buy)" strokeWidth={2}
+          <Area type="monotone" dataKey="pred" stroke="var(--signal-buy)" strokeWidth={2}
             strokeDasharray="5 3" fill="url(#gPred)"
             dot={{ r:3, fill:"var(--signal-buy)", strokeWidth:0 }} connectNulls/>
         </AreaChart>
@@ -93,19 +117,15 @@ export default function ForecastChart({
 
       {/* 5-day breakdown */}
       {forecast?.values?.length > 0 && lastPrice && (
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)",
-          gap:6, marginTop:14 }}>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:6, marginTop:14 }}>
           {forecast.values.map((v, i) => {
             const pct = ((v - lastPrice) / lastPrice * 100);
             const up  = v >= lastPrice;
             return (
-              <div key={i} style={{
-                padding:"9px 10px",
-                background:"var(--navy-800)",
+              <div key={i} style={{ padding:"9px 10px", background:"var(--navy-800)",
                 border:`1px solid ${up?"rgba(0,201,122,0.15)":"rgba(255,59,92,0.15)"}`,
                 borderTop:`2px solid ${up?"var(--signal-buy)":"var(--signal-sell)"}`,
-                borderRadius:2, textAlign:"center",
-              }}>
+                borderRadius:2, textAlign:"center" }}>
                 <div style={{ fontFamily:"var(--font-mono)", fontSize:9,
                   color:"var(--text-muted)", marginBottom:3 }}>+{i+1}J</div>
                 <div style={{ fontFamily:"var(--font-display)", fontWeight:700,
@@ -122,11 +142,10 @@ export default function ForecastChart({
         </div>
       )}
 
-      {/* Trade levels (from real prices) */}
+      {/* Trade levels */}
       {levels && (
         <div style={{ marginTop:14, padding:"12px 14px",
-          border:"1px solid var(--border)", borderRadius:2,
-          background:"var(--navy-800)",
+          border:"1px solid var(--border)", borderRadius:2, background:"var(--navy-800)",
           display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12 }}>
           {[
             { k:"ENTRÉE",    v:`$${levels.entry_price}`, c:"var(--text-primary)" },
@@ -145,11 +164,11 @@ export default function ForecastChart({
       )}
 
       {/* Legend */}
-      <div style={{ display:"flex", gap:20, marginTop:12,
-        paddingTop:10, borderTop:"1px solid var(--border-subtle)" }}>
+      <div style={{ display:"flex", gap:20, marginTop:12, paddingTop:10,
+        borderTop:"1px solid var(--border-subtle)" }}>
         {[
-          { color:"var(--gold)",       dash:false, label:"Historique (20J)"                                       },
-          { color:"var(--signal-buy)", dash:true,  label:`TimesFM ${forecast?.simulated?"(simulé)":"(HF Space)"}` },
+          { color:"var(--gold)",       dash:false, label:"Historique (20J)" },
+          { color:"var(--signal-buy)", dash:true,  label:`TimesFM${forecast?.simulated?" (simulé)":""}` },
         ].map(l => (
           <div key={l.label} style={{ display:"flex", alignItems:"center", gap:7 }}>
             <svg width="24" height="10">
