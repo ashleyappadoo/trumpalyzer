@@ -1,3 +1,12 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Vercel Serverless Function — Claude API Proxy
+//  Route : POST /api/claude
+//
+//  - ANTHROPIC_API_KEY in Vercel env vars only
+//  - web_search removed: news now fetched via /api/news (GDELT/NewsAPI)
+//  - Claude only does NLP + calculation — token usage ~300-500/request
+// ─────────────────────────────────────────────────────────────────────────────
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function callAnthropic(apiKey, body, attempt = 1) {
@@ -12,8 +21,8 @@ async function callAnthropic(apiKey, body, attempt = 1) {
   });
 
   if (res.status === 429 && attempt < 4) {
-    const wait = attempt * 15000;
-    console.log(`429 rate limit — retry ${attempt}/3 in ${wait}ms`);
+    const wait = attempt * 10000; // 10s, 20s, 30s
+    console.log(`[CLAUDE] 429 retry ${attempt}/3 in ${wait}ms`);
     await sleep(wait);
     return callAnthropic(apiKey, body, attempt + 1);
   }
@@ -28,63 +37,49 @@ export default async function handler(req, res) {
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    console.error("[TRUMPALYZER] FATAL: ANTHROPIC_API_KEY is not set in Vercel env vars");
+    console.error("[CLAUDE] ANTHROPIC_API_KEY not set");
     return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
   }
 
-  const { system, userMsg, max_tokens = 2000, delayMs = 0, useWebSearch = false } = req.body || {};
+  const { system, userMsg, max_tokens = 1500, delayMs = 0 } = req.body || {};
 
   if (!userMsg) {
-    console.error("[TRUMPALYZER] Bad request: missing userMsg");
     return res.status(400).json({ error: "Missing userMsg" });
   }
 
-  console.log(`[TRUMPALYZER] Request — useWebSearch:${useWebSearch} | delayMs:${delayMs} | max_tokens:${max_tokens} | userMsg length:${userMsg.length}`);
+  console.log(`[CLAUDE] Request — max_tokens:${max_tokens} | delayMs:${delayMs} | userMsg:${userMsg.length} chars`);
 
   if (delayMs > 0) {
-    console.log(`[TRUMPALYZER] Waiting ${delayMs}ms before calling Anthropic...`);
+    console.log(`[CLAUDE] Waiting ${delayMs}ms...`);
     await sleep(delayMs);
   }
 
-  const anthropicBody = {
-    model:    "claude-sonnet-4-20250514",
-    max_tokens,
-    system:   system || "",
-    messages: [{ role: "user", content: userMsg }],
-  };
-
-  if (useWebSearch) {
-    anthropicBody.tools = [{ type: "web_search_20250305", name: "web_search" }];
-  }
-
-  console.log(`[TRUMPALYZER] Calling Anthropic — model:${anthropicBody.model} | tools:${useWebSearch ? "web_search" : "none"}`);
-
   try {
-    const response = await callAnthropic(apiKey, anthropicBody);
+    const response = await callAnthropic(apiKey, {
+      model:    "claude-sonnet-4-20250514",
+      max_tokens,
+      system:   system || "",
+      messages: [{ role: "user", content: userMsg }],
+      // NO tools — web_search removed, news fetched via /api/news
+    });
 
-    console.log(`[TRUMPALYZER] Anthropic response status: ${response.status}`);
+    console.log(`[CLAUDE] Status: ${response.status}`);
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error(`[TRUMPALYZER] Anthropic error ${response.status}: ${errText}`);
+      console.error(`[CLAUDE] Error ${response.status}: ${errText}`);
       return res.status(response.status).json({ error: errText });
     }
 
     const data = await response.json();
-    console.log(`[TRUMPALYZER] Response blocks: ${data.content?.length} | stop_reason: ${data.stop_reason}`);
-
     const text = data.content?.find(b => b.type === "text")?.text || "";
 
-    if (!text) {
-      console.warn(`[TRUMPALYZER] No text block. Content types: ${data.content?.map(b => b.type).join(", ")}`);
-    } else {
-      console.log(`[TRUMPALYZER] Text response: ${text.length} chars`);
-    }
+    console.log(`[CLAUDE] OK — ${text.length} chars | stop:${data.stop_reason} | tokens in:${data.usage?.input_tokens} out:${data.usage?.output_tokens}`);
 
     return res.status(200).json({ text });
 
   } catch (err) {
-    console.error(`[TRUMPALYZER] Fetch exception: ${err.message}`);
+    console.error(`[CLAUDE] Exception: ${err.message}`);
     return res.status(500).json({ error: err.message });
   }
 }
