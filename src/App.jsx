@@ -24,7 +24,7 @@ export default function App() {
   const [levels,         setLevels        ] = useState({});
   const [convergences,   setConvergences  ] = useState({});
   const [forecasts,      setForecasts     ] = useState({});
-  const [fcLoading,      setFcLoading     ] = useState(false); // per-ticker forecast loading
+  const [fcLoadingTick,  setFcLoadingTick ] = useState(null);
   const [selectedTicker, setSelectedTicker] = useState(null);
   const [backtest,       setBacktest      ] = useState(null);
   const [btLoading,      setBtLoading     ] = useState(false);
@@ -32,14 +32,23 @@ export default function App() {
   const [timesfmOk,      setTimesfmOk    ] = useState(null);
   const [tickerQueue,    setTickerQueue   ] = useState([]);
   const [pipelineError,  setPipelineError ] = useState(null);
-  const enrichingRef = useRef(false);
+  const tfBatchRef = useRef(false);
 
-  useEffect(() => { checkTimesFMHealth().then(setTimesfmOk); }, []);
+  // ── On mount: wake-up ping to HF Space + health check ────────────────────
+  useEffect(() => {
+    checkTimesFMHealth().then(ok => {
+      setTimesfmOk(ok);
+      if (!ok) {
+        // HF might be waking up — retry after 20s
+        setTimeout(() => checkTimesFMHealth().then(setTimesfmOk), 20000);
+      }
+    });
+  }, []);
 
-  // ── STEP 1 ────────────────────────────────────────────────────────────────
+  // ── STEP 1: news + Claude NLP ────────────────────────────────────────────
   const loadSignals = useCallback(async () => {
     setSigLoading(true);
-    enrichingRef.current = false;
+    tfBatchRef.current = false;
     setPrices({}); setLevels({}); setConvergences({});
     setForecasts({}); setSelectedTicker(null); setTickerQueue([]);
     setPipelineError(null);
@@ -52,7 +61,7 @@ export default function App() {
       setTickerQueue(all);
     } catch(e) {
       console.error("Step 1 error:", e);
-      setPipelineError(`STEP 1 (News + NLP) FAILED: ${e.message}`);
+      setPipelineError(`STEP 1 FAILED: ${e.message}`);
     } finally {
       setSigLoading(false);
     }
@@ -60,24 +69,24 @@ export default function App() {
 
   useEffect(() => { loadSignals(); }, []);
 
-  // ── STEP 2: Yahoo prices ──────────────────────────────────────────────────
+  // ── STEP 2: Yahoo prices (all tickers, via proxy) ────────────────────────
   useEffect(() => {
     if (!tickerQueue.length) return;
     tickerQueue.forEach(async tick => {
       if (prices[tick]) return;
       const p = await fetchYahoo(tick);
       if (p) setPrices(prev => ({ ...prev, [tick]: p }));
+      else console.warn(`[App] No price data for ${tick}`);
     });
   }, [tickerQueue]);
 
-  // ── STEP 3: JS math levels (instant, as soon as a price arrives) ──────────
+  // ── STEP 3: JS math levels (runs as prices arrive) ───────────────────────
   useEffect(() => {
     if (!events.length) return;
     const allTicks = events
       .flatMap(e => e.tickers?.map(t => t.ticker) || [])
       .filter((v, i, a) => a.indexOf(v) === i);
 
-    // Compute levels for any ticker that has a price but no levels yet
     const needsLevels = allTicks.filter(tick => prices[tick] && !levels[tick]);
     if (!needsLevels.length) return;
 
@@ -96,7 +105,7 @@ export default function App() {
     setLevels(prev => ({ ...prev, ...newLevels }));
   }, [prices, events]);
 
-  // ── STEP 4: TimesFM batch (runs once all prices ready) ────────────────────
+  // ── STEP 4: TimesFM batch (once all prices ready) ────────────────────────
   useEffect(() => {
     const allTicks = events
       .flatMap(e => e.tickers?.map(t => t.ticker) || [])
@@ -105,8 +114,8 @@ export default function App() {
     const allPricesReady = allTicks.length > 0 && allTicks.every(t => prices[t]);
     const alreadyDone    = allTicks.length > 0 && allTicks.every(t => convergences[t]);
 
-    if (!allPricesReady || alreadyDone || enrichingRef.current) return;
-    enrichingRef.current = true;
+    if (!allPricesReady || alreadyDone || tfBatchRef.current) return;
+    tfBatchRef.current = true;
 
     allTicks.forEach(async tick => {
       try {
@@ -115,41 +124,38 @@ export default function App() {
         setConvergences(prev => ({ ...prev, [tick]: fc }));
         setForecasts(prev    => ({ ...prev, [tick]: { ticker: tick, ...fc } }));
       } catch(e) {
-        console.error(`Step 4 error ${tick}:`, e);
+        console.error(`TimesFM ${tick}:`, e);
+        // Set simulated fallback so we don't retry forever
+        setForecasts(prev => prev[tick] ? prev : { ...prev, [tick]: null });
       }
     });
-
-    // Release lock after a delay to allow retries on refresh
-    setTimeout(() => { enrichingRef.current = false; }, 5000);
   }, [prices, events]);
 
-  // ── Select ticker: triggers forecast immediately if not ready ─────────────
+  // ── Select ticker → go to Forecast, load on demand if needed ─────────────
   const handleSelectTicker = useCallback(async (tick) => {
     setSelectedTicker(tick);
     setTab("forecast");
 
-    // If forecast already loaded, nothing to do
-    if (forecasts[tick]) return;
+    if (forecasts[tick] !== undefined) return; // already loaded or attempted
 
-    // If price available but forecast not yet: load now
-    if (prices[tick] && !forecasts[tick]) {
-      setFcLoading(true);
+    if (prices[tick]) {
+      setFcLoadingTick(tick);
       try {
         const meta = events.flatMap(e => e.tickers||[]).find(t => t.ticker === tick);
         const fc   = await fetchTimesFMWithConvergence(prices[tick].closes, meta?.signal || "WATCH");
         setConvergences(prev => ({ ...prev, [tick]: fc }));
         setForecasts(prev    => ({ ...prev, [tick]: { ticker: tick, ...fc } }));
       } catch(e) {
-        console.error("Forecast on demand error:", e);
+        console.error("On-demand forecast error:", e);
       } finally {
-        setFcLoading(false);
+        setFcLoadingTick(null);
       }
     }
   }, [events, prices, forecasts]);
 
-  // When prices arrive for selected ticker, trigger forecast if missing
+  // Trigger forecast when price arrives for selected ticker
   useEffect(() => {
-    if (!selectedTicker || !prices[selectedTicker] || forecasts[selectedTicker]) return;
+    if (!selectedTicker || !prices[selectedTicker] || forecasts[selectedTicker] !== undefined) return;
     handleSelectTicker(selectedTicker);
   }, [prices, selectedTicker]);
 
@@ -174,16 +180,17 @@ export default function App() {
     e.tickers?.forEach(t => { if(sigCount[t.signal]!=null) sigCount[t.signal]++; });
   });
 
-  const confirmCount = Object.values(convergences).filter(c => c.convergence==="confirmed").length;
-  const divergeCount = Object.values(convergences).filter(c => c.convergence==="divergent").length;
+  const confirmCount = Object.values(convergences).filter(c => c?.convergence==="confirmed").length;
+  const divergeCount = Object.values(convergences).filter(c => c?.convergence==="divergent").length;
 
+  // Build chart data — show historical even if forecast not yet loaded
   const chartData = (() => {
     if (!selectedTicker || !prices[selectedTicker]) return [];
     const hist = prices[selectedTicker].closes.slice(-20).map((v,i) => ({
       i, hist:+v.toFixed(2), label:i===19?"TODAY":`D-${19-i}`,
     }));
     const fc = forecasts[selectedTicker];
-    if (!fc?.values) return hist; // show historical while forecast loads
+    if (!fc?.values) return hist;
     return [...hist, ...fc.values.map((v,i) => ({ i:20+i, pred:v, label:`+${i+1}J` }))];
   })();
 
@@ -219,8 +226,10 @@ export default function App() {
         <div style={{ position:"absolute", top:0, left:0, right:0, height:3,
           background:"linear-gradient(90deg, var(--crimson) 0%, var(--crimson-dark) 50%, var(--crimson) 100%)",
           animation:"glow-pulse 3s ease-in-out infinite" }}/>
+
         <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
           padding:"14px 20px", flexWrap:"wrap", gap:10 }}>
+
           <div style={{ display:"flex", alignItems:"center", gap:12 }}>
             <div style={{ width:10, height:10, borderRadius:"50%",
               background: sigLoading?"var(--signal-watch)":"var(--signal-buy)",
@@ -253,14 +262,12 @@ export default function App() {
                 )
               )}
               {confirmCount > 0 && (
-                <div style={{ padding:"3px 10px", borderRadius:2,
-                  fontFamily:"var(--font-mono)", fontSize:10,
+                <div style={{ padding:"3px 10px", borderRadius:2, fontFamily:"var(--font-mono)", fontSize:10,
                   background:"rgba(0,201,122,0.06)", border:"1px solid rgba(0,201,122,0.2)",
                   color:"var(--signal-buy)" }}>✓ {confirmCount} CONFIRMÉS</div>
               )}
               {divergeCount > 0 && (
-                <div style={{ padding:"3px 10px", borderRadius:2,
-                  fontFamily:"var(--font-mono)", fontSize:10,
+                <div style={{ padding:"3px 10px", borderRadius:2, fontFamily:"var(--font-mono)", fontSize:10,
                   background:"rgba(255,59,92,0.06)", border:"1px solid rgba(255,59,92,0.2)",
                   color:"var(--signal-sell)" }}>⚠ {divergeCount} DIVERGENTS</div>
               )}
@@ -367,7 +374,7 @@ export default function App() {
                   {events.length} ÉVÉNEMENTS · CLIQUER POUR DÉVELOPPER
                 </div>
                 <div style={{ fontFamily:"var(--font-mono)", fontSize:9, color:"var(--text-muted)" }}>
-                  NewsAPI/GDELT → Claude NLP → Yahoo Live → TimesFM
+                  NewsAPI/GDELT → Claude NLP → Yahoo Proxy → TimesFM
                 </div>
               </div>
               <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
@@ -383,14 +390,16 @@ export default function App() {
                   </div>
                 ))}
               </div>
+
+              {/* Pipeline status bar */}
               <div style={{ marginTop:14, padding:"10px 14px",
                 background:"var(--navy-700)", border:"1px solid var(--border)",
                 borderRadius:2, display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
                 {[
-                  { step:"1 · NEWS + NLP",   done:events.length>0,              note:`${events.length} événements` },
-                  { step:"2 · YAHOO PRICES", done:Object.keys(prices).length>0, note:`${Object.keys(prices).length}/${allTickers.length} tickers` },
-                  { step:"3 · LEVELS (JS)",  done:Object.keys(levels).length>0, note:`${Object.keys(levels).length} calculés` },
-                  { step:"4 · TIMESFM",      done:Object.keys(forecasts).length>0, note:`${confirmCount} confirmés` },
+                  { step:"1 · NEWS + NLP",    done:events.length>0,                  note:`${events.length} événements` },
+                  { step:"2 · YAHOO PROXY",   done:Object.keys(prices).length>0,     note:`${Object.keys(prices).length}/${allTickers.length} tickers` },
+                  { step:"3 · LEVELS (JS)",   done:Object.keys(levels).length>0,     note:`${Object.keys(levels).length} calculés` },
+                  { step:"4 · TIMESFM",       done:Object.keys(forecasts).length>0,  note:`${confirmCount} confirmés` },
                 ].map(({ step, done, note }) => (
                   <div key={step} style={{ textAlign:"center" }}>
                     <div style={{ fontFamily:"var(--font-mono)", fontSize:8,
@@ -440,7 +449,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Show chart as soon as we have price data — even if forecast is still loading */}
+            {/* Show chart as soon as price data available */}
             {selectedTicker && prices[selectedTicker] && chartData.length > 0 ? (
               <div>
                 <ForecastChart
@@ -451,7 +460,7 @@ export default function App() {
                   tickerMeta={tickerMeta}
                   levels={levels[selectedTicker]}
                 />
-                {fcLoading && !forecasts[selectedTicker] && (
+                {(fcLoadingTick === selectedTicker) && !forecasts[selectedTicker] && (
                   <div style={{ marginTop:10, padding:"8px 14px",
                     background:"var(--navy-700)", border:"1px solid var(--border)",
                     borderRadius:2, fontFamily:"var(--font-mono)", fontSize:10,
@@ -459,7 +468,12 @@ export default function App() {
                     <div style={{ width:12, height:12, border:"1px solid var(--text-muted)",
                       borderTop:"1px solid var(--gold)", borderRadius:"50%",
                       animation:"spin 0.8s linear infinite" }}/>
-                    Chargement prévision TimesFM…
+                    Chargement prévision TimesFM HF Space…
+                    {!timesfmOk && (
+                      <span style={{ color:"var(--signal-watch)", fontSize:9 }}>
+                        (HF Space en réveil ~20s)
+                      </span>
+                    )}
                   </div>
                 )}
               </div>
@@ -558,7 +572,7 @@ export default function App() {
               color:"var(--gold)", fontSize:14, letterSpacing:1 }}>TRUMPALYZER</span>
             <span style={{ fontFamily:"var(--font-mono)", fontSize:9,
               color:"var(--text-muted)", marginLeft:10 }}>
-              NewsAPI/GDELT · Claude NLP · Yahoo Finance · HF TimesFM
+              NewsAPI/GDELT · Claude NLP · Yahoo Proxy · HF TimesFM
             </span>
           </div>
           <div style={{ fontFamily:"var(--font-mono)", fontSize:9,
