@@ -9,8 +9,11 @@ export default function EventCard({
   const ago = ev.hours_ago < 1
     ? `${Math.round(ev.hours_ago * 60)}MIN`
     : ev.hours_ago < 24
-      ? `${ev.hours_ago}H`
+      ? `${Math.round(ev.hours_ago)}H`
       : `${Math.round(ev.hours_ago / 24)}D`;
+
+  // Check if any ticker signal differs from overall signal
+  const hasMixedSignals = ev.tickers?.some(t => t.signal !== ev.overall_signal);
 
   return (
     <div
@@ -29,7 +32,6 @@ export default function EventCard({
         justifyContent:"space-between", alignItems:"flex-start" }}>
 
         <div style={{ flex:1, minWidth:0, marginRight:14 }}>
-          {/* Meta */}
           <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:5 }}>
             <span style={{
               padding:"1px 7px",
@@ -53,7 +55,6 @@ export default function EventCard({
             ))}
           </div>
 
-          {/* Headline */}
           <div style={{ fontFamily:"var(--font-display)", fontWeight:700,
             fontSize:15, color:"var(--text-primary)", lineHeight:1.35 }}>
             {ev.headline}
@@ -71,7 +72,11 @@ export default function EventCard({
         {/* Badges */}
         <div style={{ flexShrink:0, display:"flex", flexDirection:"column",
           alignItems:"flex-end", gap:5 }}>
-          <SignalBadge sig={ev.overall_signal} />
+          <div style={{ display:"flex", alignItems:"center", gap:5 }}>
+            <span style={{ fontFamily:"var(--font-mono)", fontSize:8,
+              color:"var(--text-muted)" }}>GLOBAL</span>
+            <SignalBadge sig={ev.overall_signal} />
+          </div>
           <span style={{
             padding:"2px 8px", borderRadius:2,
             fontFamily:"var(--font-mono)", fontSize:9,
@@ -82,6 +87,17 @@ export default function EventCard({
           }}>
             {ev.sentiment?.toUpperCase()}
           </span>
+          {/* Warn when tickers diverge from overall signal */}
+          {hasMixedSignals && (
+            <span style={{
+              padding:"1px 6px", borderRadius:2,
+              fontFamily:"var(--font-mono)", fontSize:8,
+              background:"rgba(245,166,35,0.08)", border:"1px solid rgba(245,166,35,0.2)",
+              color:"var(--signal-watch)",
+            }}>
+              ⚡ SIGNAUX MIXTES
+            </span>
+          )}
         </div>
       </div>
 
@@ -89,9 +105,21 @@ export default function EventCard({
       {isActive && ev.tickers?.length > 0 && (
         <div style={{ padding:"0 16px 16px" }}
           onClick={e => e.stopPropagation()}>
+
+          {/* Explain mixed signals */}
+          {hasMixedSignals && (
+            <div style={{ marginBottom:10, padding:"6px 10px",
+              background:"rgba(245,166,35,0.06)", border:"1px solid rgba(245,166,35,0.15)",
+              borderRadius:2, fontFamily:"var(--font-mono)", fontSize:9,
+              color:"var(--signal-watch)", lineHeight:1.5 }}>
+              ⚡ Le signal global ({ev.overall_signal}) reflète la tendance macro de l'événement.
+              Chaque ticker a son propre signal selon son exposition sectorielle.
+            </div>
+          )}
+
           <div style={{ fontFamily:"var(--font-mono)", fontSize:8,
             letterSpacing:3, color:"var(--text-muted)", marginBottom:10 }}>
-            INSTRUMENTS IMPACTÉS — PRIX ANCRÉS SUR COURS YAHOO LIVE · CLIQUER POUR FORECAST
+            INSTRUMENTS IMPACTÉS · SIGNAL PAR TICKER · CLIQUER POUR FORECAST
           </div>
           <div style={{
             display:"grid",
